@@ -1,22 +1,15 @@
 import abc
-import enum
 import logging
 from dataclasses import dataclass
-from typing import Generator, Optional, Union
+from typing import Generator, Optional, Union, Dict, List
 
 import simpy
 from ether.core import Node, UninterruptingFlow
 
+from sim.core import Environment
+from sim.workflow.model import DataPassingMode
+
 logger = logging.getLogger(__name__)
-
-
-class DataPassingMode(str, enum.Enum):
-    """
-    Data passing strategies for serverless edge workflows.
-    """
-    DIRECT = "direct"                  # Direct P2P transmission (Node A -> Node B)
-    REMOTE_STORAGE = "remote_storage"  # Triangular transmission (Node A -> Storage -> Node B)
-    COLOCATED = "colocated"            # Local memory/IPC transfer on the same node
 
 
 @dataclass
@@ -41,20 +34,30 @@ class DataChannel(abc.ABC):
     Abstract interface for data transfer channels between workflow function replicas.
     """
 
-    def __init__(self, mode: DataPassingMode, memory_bandwidth_bytes_per_sec: float = 1e9):
+    def __init__(
+        self,
+        mode: DataPassingMode,
+        memory_bandwidth_bytes_per_sec: float = 1e9,
+        min_memory_latency: float = 1e-6
+    ):
         """
         :param mode: The data passing mode.
         :param memory_bandwidth_bytes_per_sec: In-memory/IPC bandwidth for colocated transfers
                                                 (default: 1 GB/s).
+        :param min_memory_latency: Minimum non-zero latency (in seconds) for in-memory / local IPC
+                                   transfers (default: 1 microsecond = 1e-6 s). This reflects real
+                                   syscall/buffer allocation overhead and prevents zero-duration
+                                   event ambiguity in SimPy.
         """
-        self.mode = mode
-        self.memory_bandwidth = memory_bandwidth_bytes_per_sec
-        self.transfer_records = []
+        self.mode: DataPassingMode = mode
+        self.memory_bandwidth: float = memory_bandwidth_bytes_per_sec
+        self.min_memory_latency: float = min_memory_latency
+        self.transfer_records: List[DataTransferRecord] = []
 
     @abc.abstractmethod
     def transfer(
         self,
-        env,
+        env: Environment,
         source_node: Union[str, Node],
         target_node: Union[str, Node],
         size_bytes: int,
@@ -62,7 +65,7 @@ class DataChannel(abc.ABC):
         target_task: str = ""
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         """
-        SimPy generator that simulates intermediate data movement between source_node and target_node.
+        SimPy generator simulating intermediate data movement between source_node and target_node.
         """
         pass
 
@@ -75,16 +78,25 @@ class DataChannel(abc.ABC):
             raise ValueError(f"Node '{node}' was not found in the topology.")
         return found
 
-    def _execute_network_flow(self, env, src_node: Node, dst_node: Node, size_bytes: int) -> Generator[simpy.Event, None, None]:
+    def _execute_network_flow(
+        self,
+        env: Environment,
+        src_node: Node,
+        dst_node: Node,
+        size_bytes: int,
+        flow_tag: str = "workflow_data"
+    ) -> Generator[simpy.Event, None, None]:
         """
         Executes a network flow between src_node and dst_node using Ether.
-        If src_node == dst_node, simulates local memory transfer.
+        If src_node == dst_node, simulates local in-memory IPC transfer.
+        Also records telemetry in env.metrics if available.
         """
         if src_node == dst_node or size_bytes <= 0:
-            local_duration = size_bytes / self.memory_bandwidth if size_bytes > 0 else 1e-6
-            yield env.timeout(max(local_duration, 1e-6))
+            local_duration = size_bytes / self.memory_bandwidth if size_bytes > 0 else self.min_memory_latency
+            yield env.timeout(max(local_duration, self.min_memory_latency))
             return
 
+        t_start = env.now
         route = env.topology.route(src_node, dst_node)
         if env.flow_factory is not None:
             flow = env.flow_factory.create_flow(env, size_bytes, route)
@@ -92,6 +104,13 @@ class DataChannel(abc.ABC):
             flow = UninterruptingFlow(env, size_bytes, route)
 
         yield flow.start()
+
+        # Telemetry: integrate with faas-sim global metrics if enabled
+        if getattr(env, "metrics", None) is not None:
+            flow_duration = env.now - t_start
+            for hop in route.hops:
+                env.metrics.log_network(size_bytes, flow_tag, hop)
+            env.metrics.log_flow(size_bytes, flow_duration, route.source, route.destination, flow_tag)
 
 
 class DirectDataChannel(DataChannel):
@@ -101,20 +120,24 @@ class DirectDataChannel(DataChannel):
     the network topology (peer-to-peer / point-to-point) without any intermediate storage hop.
     """
 
-    def __init__(self, memory_bandwidth_bytes_per_sec: float = 1e9):
-        super().__init__(DataPassingMode.DIRECT, memory_bandwidth_bytes_per_sec)
+    def __init__(
+        self,
+        memory_bandwidth_bytes_per_sec: float = 1e9,
+        min_memory_latency: float = 1e-6
+    ):
+        super().__init__(DataPassingMode.DIRECT, memory_bandwidth_bytes_per_sec, min_memory_latency)
 
     def transfer(
         self,
-        env,
+        env: Environment,
         source_node: Union[str, Node],
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
         target_task: str = ""
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
-        src = self._resolve_node(env.topology, source_node)
-        dst = self._resolve_node(env.topology, target_node)
+        src: Node = self._resolve_node(env.topology, source_node)
+        dst: Node = self._resolve_node(env.topology, target_node)
 
         t_start = env.now
         logger.debug(
@@ -122,7 +145,7 @@ class DirectDataChannel(DataChannel):
             size_bytes, source_task, src.name, target_task, dst.name, t_start
         )
 
-        yield from self._execute_network_flow(env, src, dst, size_bytes)
+        yield from self._execute_network_flow(env, src, dst, size_bytes, flow_tag="direct_passing")
 
         t_end = env.now
         record = DataTransferRecord(
@@ -149,40 +172,45 @@ class RemoteStorageDataChannel(DataChannel):
       Hop 2: Download from storage_node to target_node.
     """
 
-    def __init__(self, storage_node: Union[str, Node], memory_bandwidth_bytes_per_sec: float = 1e9):
-        super().__init__(DataPassingMode.REMOTE_STORAGE, memory_bandwidth_bytes_per_sec)
-        self.storage_node_ref = storage_node
+    def __init__(
+        self,
+        storage_node: Union[str, Node],
+        memory_bandwidth_bytes_per_sec: float = 1e9,
+        min_memory_latency: float = 1e-6
+    ):
+        super().__init__(DataPassingMode.REMOTE_STORAGE, memory_bandwidth_bytes_per_sec, min_memory_latency)
+        self.storage_node_ref: Union[str, Node] = storage_node
 
     def transfer(
         self,
-        env,
+        env: Environment,
         source_node: Union[str, Node],
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
         target_task: str = ""
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
-        src = self._resolve_node(env.topology, source_node)
-        dst = self._resolve_node(env.topology, target_node)
-        storage = self._resolve_node(env.topology, self.storage_node_ref)
+        src: Node = self._resolve_node(env.topology, source_node)
+        dst: Node = self._resolve_node(env.topology, target_node)
+        storage: Node = self._resolve_node(env.topology, self.storage_node_ref)
 
         t_start = env.now
         logger.debug(
-            "[RemoteStorage] Hop 1: Uploading %d bytes from %s (%s) to storage %s at t=%.4f",
+            "[RemoteStorage] Hop 1 (Upload): %d bytes from %s (%s) to storage %s at t=%.4f",
             size_bytes, source_task, src.name, storage.name, t_start
         )
 
-        # Hop 1: Upload to storage
-        yield from self._execute_network_flow(env, src, storage, size_bytes)
+        # Hop 1: Upload from worker to storage
+        yield from self._execute_network_flow(env, src, storage, size_bytes, flow_tag="storage_upload")
 
         t_mid = env.now
         logger.debug(
-            "[RemoteStorage] Hop 2: Downloading %d bytes from storage %s to %s (%s) at t=%.4f",
+            "[RemoteStorage] Hop 2 (Download): %d bytes from storage %s to %s (%s) at t=%.4f",
             size_bytes, storage.name, target_task, dst.name, t_mid
         )
 
-        # Hop 2: Download from storage to destination
-        yield from self._execute_network_flow(env, storage, dst, size_bytes)
+        # Hop 2: Download from storage to worker
+        yield from self._execute_network_flow(env, storage, dst, size_bytes, flow_tag="storage_download")
 
         t_end = env.now
         record = DataTransferRecord(
@@ -206,24 +234,28 @@ class ColocatedDataChannel(DataChannel):
     Colocated Channel (Same-Node / VM Storage):
     Assumes functions are scheduled on the same VM/host. Data transfer is
     achieved via in-memory buffer or local volume IPC.
-    If source and target are placed on different nodes, raises an error.
     """
 
-    def __init__(self, memory_bandwidth_bytes_per_sec: float = 1e9, strict: bool = True):
-        super().__init__(DataPassingMode.COLOCATED, memory_bandwidth_bytes_per_sec)
-        self.strict = strict
+    def __init__(
+        self,
+        memory_bandwidth_bytes_per_sec: float = 1e9,
+        min_memory_latency: float = 1e-6,
+        strict: bool = True
+    ):
+        super().__init__(DataPassingMode.COLOCATED, memory_bandwidth_bytes_per_sec, min_memory_latency)
+        self.strict: bool = strict
 
     def transfer(
         self,
-        env,
+        env: Environment,
         source_node: Union[str, Node],
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
         target_task: str = ""
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
-        src = self._resolve_node(env.topology, source_node)
-        dst = self._resolve_node(env.topology, target_node)
+        src: Node = self._resolve_node(env.topology, source_node)
+        dst: Node = self._resolve_node(env.topology, target_node)
 
         if src != dst:
             if self.strict:
@@ -237,7 +269,7 @@ class ColocatedDataChannel(DataChannel):
             )
 
         t_start = env.now
-        yield from self._execute_network_flow(env, src, dst, size_bytes)
+        yield from self._execute_network_flow(env, src, dst, size_bytes, flow_tag="colocated_memory")
         t_end = env.now
 
         record = DataTransferRecord(
@@ -254,3 +286,75 @@ class ColocatedDataChannel(DataChannel):
         )
         self.transfer_records.append(record)
         return record
+
+
+class DataTransferController:
+    """
+    Data Transfer Controller:
+    Coordinates and routes data transfers across different channels. Supports
+    heterogeneous/hybrid workflows where individual dependency edges use different
+    data passing strategies (Direct, Remote Storage, Colocated).
+    """
+
+    def __init__(
+        self,
+        storage_node: Optional[Union[str, Node]] = None,
+        memory_bandwidth_bytes_per_sec: float = 1e9,
+        min_memory_latency: float = 1e-6
+    ):
+        self.channels: Dict[DataPassingMode, DataChannel] = {
+            DataPassingMode.DIRECT: DirectDataChannel(
+                memory_bandwidth_bytes_per_sec=memory_bandwidth_bytes_per_sec,
+                min_memory_latency=min_memory_latency
+            ),
+            DataPassingMode.COLOCATED: ColocatedDataChannel(
+                memory_bandwidth_bytes_per_sec=memory_bandwidth_bytes_per_sec,
+                min_memory_latency=min_memory_latency,
+                strict=False
+            ),
+        }
+        if storage_node is not None:
+            self.channels[DataPassingMode.REMOTE_STORAGE] = RemoteStorageDataChannel(
+                storage_node=storage_node,
+                memory_bandwidth_bytes_per_sec=memory_bandwidth_bytes_per_sec,
+                min_memory_latency=min_memory_latency
+            )
+
+    def register_channel(self, mode: DataPassingMode, channel: DataChannel):
+        """Registers or overrides a channel for a specific passing mode."""
+        self.channels[mode] = channel
+
+    def transfer(
+        self,
+        env: Environment,
+        mode: DataPassingMode,
+        source_node: Union[str, Node],
+        target_node: Union[str, Node],
+        size_bytes: int,
+        source_task: str = "",
+        target_task: str = ""
+    ) -> Generator[simpy.Event, None, DataTransferRecord]:
+        """
+        Routes the data transfer to the designated DataChannel.
+        """
+        channel = self.channels.get(mode)
+        if channel is None:
+            raise ValueError(
+                f"No channel registered for data passing mode '{mode}'. "
+                f"Available modes: {list(self.channels.keys())}"
+            )
+        return (yield from channel.transfer(
+            env=env,
+            source_node=source_node,
+            target_node=target_node,
+            size_bytes=size_bytes,
+            source_task=source_task,
+            target_task=target_task
+        ))
+
+    def get_all_records(self) -> List[DataTransferRecord]:
+        """Aggregates transfer records across all managed channels."""
+        records = []
+        for channel in self.channels.values():
+            records.extend(channel.transfer_records)
+        return sorted(records, key=lambda r: r.start_time)
