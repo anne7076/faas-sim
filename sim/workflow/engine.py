@@ -10,6 +10,7 @@ from faas.system.core import FunctionRequest
 from sim.core import Environment
 from sim.workflow.model import WorkflowDAG, WorkflowTask, DataDependency, DataPassingMode
 from sim.workflow.channel import DataTransferController, DataTransferRecord
+from sim.workflow.scheduler import WorkflowScheduler, DataAwareWorkflowScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +73,21 @@ class WorkflowEngine:
         self,
         env: Environment,
         controller: Optional[DataTransferController] = None,
+        scheduler: Optional[WorkflowScheduler] = None,
         storage_node: Optional[Union[str, Node]] = None,
         default_task_duration: float = 0.5
     ):
         """
         :param env: The faas-sim Environment.
         :param controller: The DataTransferController routing data flows.
+        :param scheduler: The WorkflowScheduler for placing tasks across topology nodes.
+                          Defaults to DataAwareWorkflowScheduler(storage_node=storage_node).
         :param storage_node: Central storage node reference for remote storage transfers.
         :param default_task_duration: Fallback duration if running standalone without FaasSystem.
         """
         self.env: Environment = env
         self.controller: DataTransferController = controller or DataTransferController(storage_node=storage_node)
+        self.scheduler: WorkflowScheduler = scheduler or DataAwareWorkflowScheduler(storage_node=storage_node)
         self.default_task_duration: float = default_task_duration
 
     def execute_workflow(
@@ -279,18 +284,15 @@ class WorkflowEngine:
     ) -> Dict[str, str]:
         """
         Resolves node assignments for each task in the workflow.
+        Delegates to the configured WorkflowScheduler, then applies any manual caller overrides.
         """
-        placements: Dict[str, str] = {}
-        available_nodes = [n.name for n in self.env.topology.get_nodes()] if self.env.topology else ["default_node"]
+        placements: Dict[str, str] = dict(self.scheduler.schedule(workflow, self.env))
 
-        for idx, task_name in enumerate(workflow.tasks):
-            if task_placements and task_name in task_placements:
-                target_node = task_placements[task_name]
+        if task_placements:
+            for task_name, target_node in task_placements.items():
                 if self.env.topology and self.env.topology.find_node(target_node) is None:
                     raise ValueError(f"Placement node '{target_node}' for task '{task_name}' not found in topology.")
                 placements[task_name] = target_node
-            else:
-                placements[task_name] = available_nodes[idx % len(available_nodes)]
 
         return placements
 

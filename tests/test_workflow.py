@@ -12,6 +12,7 @@ from sim.workflow.channel import (
     DataTransferController,
 )
 from sim.workflow.engine import WorkflowEngine, WorkflowExecutionResult
+from sim.workflow.scheduler import RoundRobinWorkflowScheduler, DataAwareWorkflowScheduler
 
 
 class TestWorkflowDAG:
@@ -338,3 +339,112 @@ class TestWorkflowEngine:
         d_record = res.task_records["D"]
         assert d_record.start_time >= b_record.end_time
         assert d_record.start_time >= c_record.end_time
+
+
+class TestWorkflowSchedulers:
+
+    def test_round_robin_scheduler(self):
+        env = Environment()
+        env.topology = basic.example_topology()
+        nodes = [n.name for n in env.topology.get_nodes() if not n.name.startswith("switch")]
+
+        dag = WorkflowDAG("rr-pipeline")
+        dag.add_task(WorkflowTask(name="T1", function_name="f1"))
+        dag.add_task(WorkflowTask(name="T2", function_name="f2"))
+        dag.add_task(WorkflowTask(name="T3", function_name="f3"))
+        dag.add_task(WorkflowTask(name="T4", function_name="f4"))
+        dag.add_dependency("T1", "T2")
+        dag.add_dependency("T2", "T3")
+        dag.add_dependency("T3", "T4")
+
+        scheduler = RoundRobinWorkflowScheduler()
+        placements = scheduler.schedule(dag, env)
+
+        assert len(placements) == 4
+        assert placements["T1"] == nodes[0]
+        assert placements["T2"] == nodes[1 % len(nodes)]
+        assert placements["T3"] == nodes[2 % len(nodes)]
+        assert placements["T4"] == nodes[3 % len(nodes)]
+
+    def test_data_aware_scheduler_places_coupled_tasks_together(self):
+        env = Environment()
+        env.topology = basic.example_topology()
+
+        dag = WorkflowDAG("coupled-pipeline", default_mode=DataPassingMode.DIRECT)
+        dag.add_task(WorkflowTask(name="extract", function_name="fn1"))
+        dag.add_task(WorkflowTask(name="transform", function_name="fn2"))
+
+        # Heavy data dependency between extract and transform (50 MB)
+        dag.add_dependency("extract", "transform", size_bytes=50 * 1024 * 1024)
+
+        scheduler = DataAwareWorkflowScheduler()
+        placements = scheduler.schedule(dag, env)
+
+        # To avoid moving 50 MB across the network, transform should be placed on the same node as extract
+        assert placements["transform"] == placements["extract"]
+
+    def test_workflow_engine_integrates_scheduler(self):
+        """
+        Tests that WorkflowEngine uses DataAwareWorkflowScheduler by default when no placements are given.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        flow_factory = UninterruptingFlowFactory()
+        env.flow_factory = flow_factory
+
+        dag = WorkflowDAG("auto-scheduled-dag", default_mode=DataPassingMode.DIRECT)
+        dag.add_task(WorkflowTask(name="step1", function_name="fn1"))
+        dag.add_task(WorkflowTask(name="step2", function_name="fn2"))
+        dag.add_dependency("step1", "step2", size_bytes=10 * 1024 * 1024)
+
+        # Default WorkflowEngine should use DataAwareWorkflowScheduler
+        engine = WorkflowEngine(env, default_task_duration=0.2)
+        results = []
+
+        def run_sim():
+            res = yield from engine.execute_workflow(dag)
+            results.append(res)
+
+        env.process(run_sim())
+        env.run()
+
+        res = results[0]
+        assert len(res.task_records) == 2
+        # Tasks step1 and step2 should be colocated by the data-aware scheduler
+        assert res.task_records["step1"].node_name == res.task_records["step2"].node_name
+
+    def test_data_aware_beats_round_robin_makespan(self):
+        """
+        Validates that DataAwareWorkflowScheduler outperforms RoundRobinWorkflowScheduler
+        in data transfer overhead and makespan on network-intensive pipelines.
+        """
+        def run_pipeline(scheduler):
+            env = Environment()
+            env.topology = basic.example_topology()
+            env.flow_factory = UninterruptingFlowFactory()
+
+            dag = WorkflowDAG("comparison-dag", default_mode=DataPassingMode.DIRECT)
+            dag.add_task(WorkflowTask(name="T1", function_name="fn1"))
+            dag.add_task(WorkflowTask(name="T2", function_name="fn2"))
+            dag.add_task(WorkflowTask(name="T3", function_name="fn3"))
+            # 20 MB payloads between stages
+            dag.add_dependency("T1", "T2", size_bytes=20 * 1024 * 1024)
+            dag.add_dependency("T2", "T3", size_bytes=20 * 1024 * 1024)
+
+            engine = WorkflowEngine(env, scheduler=scheduler, default_task_duration=0.1)
+            results = []
+
+            def sim():
+                res = yield from engine.execute_workflow(dag)
+                results.append(res)
+
+            env.process(sim())
+            env.run()
+            return results[0]
+
+        res_rr = run_pipeline(RoundRobinWorkflowScheduler())
+        res_da = run_pipeline(DataAwareWorkflowScheduler())
+
+        # Data-aware co-locates or selects optimal low-latency links, yielding lower transfer time
+        assert res_da.total_data_transfer_time < res_rr.total_data_transfer_time
+        assert res_da.makespan < res_rr.makespan

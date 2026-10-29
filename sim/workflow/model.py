@@ -74,7 +74,7 @@ class WorkflowDAG:
         self,
         source_task: str,
         target_task: str,
-        size_bytes: int,
+        size_bytes: int = 0,
         mode: Optional[DataPassingMode] = None
     ) -> 'WorkflowDAG':
         """

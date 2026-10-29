@@ -21,6 +21,11 @@ from .engine import (
     WorkflowExecutionResult,
     WorkflowTaskExecutionRecord,
 )
+from .scheduler import (
+    WorkflowScheduler,
+    RoundRobinWorkflowScheduler,
+    DataAwareWorkflowScheduler,
+)
 
 __all__ = [
     'WorkflowDAG',
@@ -36,4 +41,7 @@ __all__ = [
     'WorkflowEngine',
     'WorkflowExecutionResult',
     'WorkflowTaskExecutionRecord',
+    'WorkflowScheduler',
+    'RoundRobinWorkflowScheduler',
+    'DataAwareWorkflowScheduler',
 ]
