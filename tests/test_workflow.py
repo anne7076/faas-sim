@@ -11,6 +11,7 @@ from sim.workflow.channel import (
     ColocatedDataChannel,
     DataTransferController,
 )
+from sim.workflow.engine import WorkflowEngine, WorkflowExecutionResult
 
 
 class TestWorkflowDAG:
@@ -72,7 +73,6 @@ class TestDataChannels:
         env.topology = basic.example_topology()
         env.flow_factory = UninterruptingFlowFactory()
 
-        # Dynamically retrieve edge nodes and cloud server node from topology
         nodes = list(env.topology.get_nodes())
         edge_nodes = [n for n in nodes if 'rpi' in n.name]
         cloud_nodes = [n for n in nodes if 'server' in n.name]
@@ -112,11 +112,8 @@ class TestDataChannels:
         env.process(simulation_process())
         env.run()
 
-        # Colocated should be virtually instantaneous (in-memory)
         assert results["colocated"] < results["direct"]
-        # Direct passing should be significantly faster than triangular transfer to cloud storage
         assert results["direct"] < results["remote"]
-        # Remote storage takes 2 hops (edge -> cloud, cloud -> edge)
         assert results["remote"] > results["direct"] * 1.5
 
     def test_data_transfer_controller_hybrid(self):
@@ -124,7 +121,6 @@ class TestDataChannels:
         env.topology = basic.example_topology()
         env.flow_factory = UninterruptingFlowFactory()
 
-        # Dynamically retrieve edge nodes and cloud server node
         nodes = list(env.topology.get_nodes())
         edge_nodes = [n for n in nodes if 'rpi' in n.name]
         cloud_nodes = [n for n in nodes if 'server' in n.name]
@@ -184,3 +180,161 @@ class TestDataChannels:
             DataPassingMode.COLOCATED,
             DataPassingMode.REMOTE_STORAGE
         ]
+
+
+class TestWorkflowEngine:
+
+    def test_workflow_engine_end_to_end(self):
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+
+        nodes = list(env.topology.get_nodes())
+        edge_nodes = [n for n in nodes if 'rpi' in n.name]
+        cloud_nodes = [n for n in nodes if 'server' in n.name]
+
+        node1 = edge_nodes[0].name
+        node2 = edge_nodes[1].name
+        storage = cloud_nodes[0].name
+
+        # Pipeline: A -> B -> C with 10MB payload between each step
+        payload = 10 * 1024 * 1024
+        task_duration = 0.2
+
+        def build_dag(mode: DataPassingMode) -> WorkflowDAG:
+            dag = WorkflowDAG(f"pipeline-{mode.value}", default_mode=mode)
+            dag.add_task(WorkflowTask(name="prep", function_name="data-prep"))
+            dag.add_task(WorkflowTask(name="train", function_name="model-train"))
+            dag.add_task(WorkflowTask(name="eval", function_name="model-eval"))
+            dag.add_dependency("prep", "train", size_bytes=payload)
+            dag.add_dependency("train", "eval", size_bytes=payload)
+            return dag
+
+        # 1. Colocated execution (all on node1)
+        engine_coloc = WorkflowEngine(env, storage_node=storage, default_task_duration=task_duration)
+        dag_coloc = build_dag(DataPassingMode.COLOCATED)
+        res_coloc: list = []
+
+        def run_coloc():
+            r = yield from engine_coloc.execute_workflow(
+                dag_coloc, task_placements={"prep": node1, "train": node1, "eval": node1}
+            )
+            res_coloc.append(r)
+
+        env.process(run_coloc())
+        env.run()
+
+        # 2. Direct P2P execution (distributed across node1 and node2)
+        env2 = Environment()
+        env2.topology = basic.example_topology()
+        env2.flow_factory = UninterruptingFlowFactory()
+        nodes2 = list(env2.topology.get_nodes())
+        e_node1 = [n for n in nodes2 if 'rpi' in n.name][0].name
+        e_node2 = [n for n in nodes2 if 'rpi' in n.name][1].name
+        c_storage = [n for n in nodes2 if 'server' in n.name][0].name
+
+        engine_direct = WorkflowEngine(env2, storage_node=c_storage, default_task_duration=task_duration)
+        dag_direct = build_dag(DataPassingMode.DIRECT)
+        res_direct: list = []
+
+        def run_direct():
+            r = yield from engine_direct.execute_workflow(
+                dag_direct, task_placements={"prep": e_node1, "train": e_node2, "eval": e_node1}
+            )
+            res_direct.append(r)
+
+        env2.process(run_direct())
+        env2.run()
+
+        # 3. Remote Storage execution (distributed across node1 and node2, data via cloud server)
+        env3 = Environment()
+        env3.topology = basic.example_topology()
+        env3.flow_factory = UninterruptingFlowFactory()
+        nodes3 = list(env3.topology.get_nodes())
+        e3_node1 = [n for n in nodes3 if 'rpi' in n.name][0].name
+        e3_node2 = [n for n in nodes3 if 'rpi' in n.name][1].name
+        c3_storage = [n for n in nodes3 if 'server' in n.name][0].name
+
+        engine_remote = WorkflowEngine(env3, storage_node=c3_storage, default_task_duration=task_duration)
+        dag_remote = build_dag(DataPassingMode.REMOTE_STORAGE)
+        res_remote: list = []
+
+        def run_remote():
+            r = yield from engine_remote.execute_workflow(
+                dag_remote, task_placements={"prep": e3_node1, "train": e3_node2, "eval": e3_node1}
+            )
+            res_remote.append(r)
+
+        env3.process(run_remote())
+        env3.run()
+
+        r_coloc = res_coloc[0]
+        r_direct = res_direct[0]
+        r_remote = res_remote[0]
+
+        # Verify all 3 tasks completed in each experiment
+        assert len(r_coloc.task_records) == 3
+        assert len(r_direct.task_records) == 3
+        assert len(r_remote.task_records) == 3
+
+        # Makespan verification:
+        # Colocated makespan should be approximately 3 * task_duration (almost 0 transfer time)
+        assert r_coloc.makespan < r_direct.makespan
+        # Direct passing should have significantly shorter makespan than Remote Storage
+        assert r_direct.makespan < r_remote.makespan
+        # Remote storage transfer time should be significantly higher due to 2-hop cloud overhead
+        assert r_remote.total_data_transfer_time > r_direct.total_data_transfer_time
+
+    def test_diamond_parallel_execution(self):
+        """
+        Tests diamond DAG:
+               A (prep)
+              /        \
+          B (train1)   C (train2)   [Parallel execution]
+              \        /
+               D (eval)
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+
+        nodes = list(env.topology.get_nodes())
+        n1 = [n for n in nodes if 'rpi' in n.name][0].name
+        n2 = [n for n in nodes if 'rpi' in n.name][1].name
+        n3 = [n for n in nodes if 'nuc' in n.name][0].name
+
+        dag = WorkflowDAG("diamond-dag", default_mode=DataPassingMode.DIRECT)
+        dag.add_task(WorkflowTask(name="A", function_name="prep"))
+        dag.add_task(WorkflowTask(name="B", function_name="train1"))
+        dag.add_task(WorkflowTask(name="C", function_name="train2"))
+        dag.add_task(WorkflowTask(name="D", function_name="aggregate"))
+
+        dag.add_dependency("A", "B", size_bytes=1024 * 1024)
+        dag.add_dependency("A", "C", size_bytes=1024 * 1024)
+        dag.add_dependency("B", "D", size_bytes=512 * 1024)
+        dag.add_dependency("C", "D", size_bytes=512 * 1024)
+
+        engine = WorkflowEngine(env, default_task_duration=0.5)
+        results = []
+
+        def run_sim():
+            res = yield from engine.execute_workflow(
+                dag, task_placements={"A": n1, "B": n2, "C": n3, "D": n1}
+            )
+            results.append(res)
+
+        env.process(run_sim())
+        env.run()
+
+        res: WorkflowExecutionResult = results[0]
+        assert len(res.task_records) == 4
+
+        # Tasks B and C should execute concurrently (their start times should be nearly identical)
+        b_record = res.task_records["B"]
+        c_record = res.task_records["C"]
+        assert abs(b_record.start_time - c_record.start_time) < 0.2
+
+        # Task D must start strictly after BOTH B and C have finished
+        d_record = res.task_records["D"]
+        assert d_record.start_time >= b_record.end_time
+        assert d_record.start_time >= c_record.end_time
