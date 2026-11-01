@@ -1,16 +1,17 @@
 import collections
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Generator, List, Optional, Set, Union, Callable
+from typing import Callable, Counter, Dict, Generator, List, Optional, Tuple, Union
 
 import simpy
 from ether.core import Node
-from faas.system.core import FunctionRequest
+from faas.system.core import FunctionReplicaState, FunctionRequest
 
 from sim.core import Environment
-from sim.workflow.model import WorkflowDAG, WorkflowTask, DataDependency, DataPassingMode
+from sim.faas import SimFunctionReplica
 from sim.workflow.channel import DataTransferController, DataTransferRecord
-from sim.workflow.scheduler import WorkflowScheduler, DataAwareWorkflowScheduler
+from sim.workflow.model import DataDependency, DataPassingMode, WorkflowDAG, WorkflowTask
+from sim.workflow.scheduler import DataAwareWorkflowScheduler, WorkflowScheduler, WorkflowSkippyScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +65,10 @@ class WorkflowEngine:
     """
     Workflow Execution Engine (Orchestrator).
 
-    Coordinates the execution of serverless workflow DAGs by directly integrating
-    with faas-sim's native `FaasSystem` invocation pipeline and gating task execution
-    on intermediate data arrivals via `DataTransferController`.
+    Coordinates the execution of serverless workflow DAGs by scheduling each task
+    on-time once its upstream parent tasks complete, transferring intermediate data
+    from the parents' actual execution nodes, and invoking functions via faas-sim's
+    native `FaasSystem` pipeline.
     """
 
     def __init__(
@@ -80,7 +82,7 @@ class WorkflowEngine:
         """
         :param env: The faas-sim Environment.
         :param controller: The DataTransferController routing data flows.
-        :param scheduler: The WorkflowScheduler for placing tasks across topology nodes.
+        :param scheduler: The WorkflowScheduler policy for placing tasks across topology nodes.
                           Defaults to DataAwareWorkflowScheduler(storage_node=storage_node).
         :param storage_node: Central storage node reference for remote storage transfers.
         :param default_task_duration: Fallback duration if running standalone without FaasSystem.
@@ -89,6 +91,7 @@ class WorkflowEngine:
         self.controller: DataTransferController = controller or DataTransferController(storage_node=storage_node)
         self.scheduler: WorkflowScheduler = scheduler or DataAwareWorkflowScheduler(storage_node=storage_node)
         self.default_task_duration: float = default_task_duration
+        self._pending_deployments: Counter[Tuple[str, str]] = collections.Counter()
 
     def execute_workflow(
         self,
@@ -99,99 +102,181 @@ class WorkflowEngine:
         """
         Main entry point to execute a workflow DAG in the simulation.
 
-        1. Resolves task-to-node placements.
-        2. Sets up dependency synchronization events.
-        3. Spawns tasks as concurrent SimPy processes (tasks wait for their input data).
-        4. Awaits completion of all terminal tasks and returns execution metrics.
+        1. Validates any explicit caller placement overrides.
+        2. Creates completion events for each task in the DAG.
+        3. Spawns tasks as concurrent SimPy processes; each task waits for its parent tasks
+           to finish computing, gets scheduled on-time, pulls incoming data from the parents'
+           actual execution nodes, and executes.
+        4. Awaits completion of all tasks and returns execution metrics for this run.
         """
         t_start = self.env.now
         logger.info("[WorkflowEngine] Starting workflow '%s' at t=%.4f", workflow.name, t_start)
 
-        placements = self._resolve_placements(workflow, task_placements)
-        data_ready_events = self._initialize_data_events(workflow)
+        placements = self._initialize_placements(task_placements)
+        task_done_events: Dict[str, simpy.Event] = {name: self.env.event() for name in workflow.tasks}
         task_records: Dict[str, WorkflowTaskExecutionRecord] = {}
+        run_transfer_records: List[DataTransferRecord] = []
 
-        # Run all tasks as concurrent SimPy processes
         task_processes = [
             self.env.process(
                 self._run_task(
                     task=task,
-                    node_name=placements[task.name],
                     workflow=workflow,
                     placements=placements,
-                    data_ready_events=data_ready_events,
+                    task_done_events=task_done_events,
                     task_records=task_records,
+                    run_transfer_records=run_transfer_records,
                     task_executors=task_executors
                 )
             )
             for task in workflow.tasks.values()
         ]
 
-        # Await completion of all tasks in the workflow
         yield simpy.AllOf(self.env, task_processes)
 
-        return self._compile_results(workflow, t_start, task_records)
+        return self._compile_results(workflow, t_start, task_records, run_transfer_records)
 
     def _run_task(
         self,
         task: WorkflowTask,
-        node_name: str,
         workflow: WorkflowDAG,
         placements: Dict[str, str],
-        data_ready_events: Dict[str, Dict[str, simpy.Event]],
+        task_done_events: Dict[str, simpy.Event],
         task_records: Dict[str, WorkflowTaskExecutionRecord],
+        run_transfer_records: List[DataTransferRecord],
         task_executors: Optional[Dict[str, Callable]]
     ) -> Generator[simpy.Event, None, None]:
         """
         Lifecycle of a single task in the workflow:
-        Step 1: Wait for all incoming data dependencies to arrive.
-        Step 2: Invoke the function (via faas-sim FaasSystem or simulated executor).
-        Step 3: Dispatch outgoing data to all downstream child tasks.
+        Step 1: Wait for all upstream parent tasks to finish computing.
+        Step 2: Schedule this task on-time (all parents have finished on known nodes).
+        Step 3: Transfer incoming data from all parents' actual nodes to `planned_node` concurrently.
+        Step 4: Invoke computation, record actual execution node, and signal completion.
         """
-        # Step 1: Wait for input data
-        yield from self._wait_for_incoming_data(task.name, data_ready_events)
+        # Step 1: Wait for upstream parent computations to complete
+        yield from self._wait_for_parents(task.name, workflow, task_done_events)
 
-        # Step 2: Invoke computation
+        # Step 2: Schedule task on-time (unless already pinned by caller override)
+        planned_node = self._schedule_task_on_time(task, workflow, placements)
+
+        # Step 3: Transfer incoming data from parents' actual nodes to `planned_node`
+        yield from self._transfer_incoming_data(
+            task=task,
+            target_node=planned_node,
+            workflow=workflow,
+            placements=placements,
+            run_transfer_records=run_transfer_records
+        )
+
+        # Step 4: Invoke computation, sync actual execution node, and notify children
         t_task_start = self.env.now
-        duration = yield from self._invoke_function(task, node_name, task_executors)
+        duration, actual_node = yield from self._invoke_function(task, planned_node, task_executors)
         t_task_end = self.env.now
 
+        placements[task.name] = actual_node
         task_records[task.name] = WorkflowTaskExecutionRecord(
             task_name=task.name,
             function_name=task.function_name,
-            node_name=node_name,
+            node_name=actual_node,
             start_time=t_task_start,
             end_time=t_task_end,
             duration=duration
         )
 
-        # Step 3: Transmit output data to downstream tasks
-        yield from self._dispatch_outgoing_data(task.name, node_name, workflow, placements, data_ready_events)
+        task_done_events[task.name].succeed()
 
-    def _wait_for_incoming_data(
+    def _wait_for_parents(
         self,
         task_name: str,
-        data_ready_events: Dict[str, Dict[str, simpy.Event]]
+        workflow: WorkflowDAG,
+        task_done_events: Dict[str, simpy.Event]
     ) -> Generator[simpy.Event, None, None]:
         """
-        Awaits all incoming data events required before this task can start.
+        Waits for all upstream parent tasks of `task_name` to finish executing.
         """
-        incoming = data_ready_events.get(task_name, {})
-        if incoming:
-            logger.debug(
-                "[WorkflowEngine] Task '%s' waiting for data from: %s at t=%.4f",
-                task_name, list(incoming.keys()), self.env.now
+        incoming_deps = workflow.get_incoming_dependencies(task_name)
+        if incoming_deps:
+            parent_events = [task_done_events[dep.source_task] for dep in incoming_deps]
+            yield simpy.AllOf(self.env, parent_events)
+
+    def _schedule_task_on_time(
+        self,
+        task: WorkflowTask,
+        workflow: WorkflowDAG,
+        placements: Dict[str, str]
+    ) -> str:
+        """
+        Schedules `task` just-in-time via `self.scheduler.schedule_task` if not already pinned.
+        """
+        if task.name in placements:
+            return placements[task.name]
+
+        node_name = self.scheduler.schedule_task(task, workflow, placements, self.env)
+        placements[task.name] = node_name
+        return node_name
+
+    def _transfer_incoming_data(
+        self,
+        task: WorkflowTask,
+        target_node: str,
+        workflow: WorkflowDAG,
+        placements: Dict[str, str],
+        run_transfer_records: List[DataTransferRecord]
+    ) -> Generator[simpy.Event, None, None]:
+        """
+        Transfers all incoming data dependencies from each parent's actual execution node
+        to `target_node` in parallel.
+        """
+        incoming_deps = workflow.get_incoming_dependencies(task.name)
+        if not incoming_deps:
+            return
+
+        transfer_processes = [
+            self.env.process(
+                self._transfer_single_edge(
+                    dep=dep,
+                    workflow=workflow,
+                    source_node=placements[dep.source_task],
+                    target_node=target_node,
+                    run_transfer_records=run_transfer_records
+                )
             )
-            yield simpy.AllOf(self.env, list(incoming.values()))
+            for dep in incoming_deps
+        ]
+        yield simpy.AllOf(self.env, transfer_processes)
+
+    def _transfer_single_edge(
+        self,
+        dep: DataDependency,
+        workflow: WorkflowDAG,
+        source_node: str,
+        target_node: str,
+        run_transfer_records: List[DataTransferRecord]
+    ) -> Generator[simpy.Event, None, None]:
+        """
+        Performs a single edge data transfer through the DataTransferController and records
+        telemetry for the current workflow run.
+        """
+        mode = dep.mode or workflow.default_mode
+        record = yield from self.controller.transfer(
+            env=self.env,
+            mode=mode,
+            source_node=source_node,
+            target_node=target_node,
+            size_bytes=dep.size_bytes,
+            source_task=dep.source_task,
+            target_task=dep.target_task
+        )
+        run_transfer_records.append(record)
 
     def _invoke_function(
         self,
         task: WorkflowTask,
         node_name: str,
         task_executors: Optional[Dict[str, Callable]]
-    ) -> Generator[simpy.Event, None, float]:
+    ) -> Generator[simpy.Event, None, Tuple[float, str]]:
         """
-        Executes the function computation.
+        Executes the function computation and returns `(duration, actual_node_name)`.
         Prioritizes:
           1. Custom user executor hook if provided.
           2. faas-sim's native `env.faas.invoke(FunctionRequest)` if deployed.
@@ -202,116 +287,112 @@ class WorkflowEngine:
         # 1. Custom executor hook
         if task_executors and task.name in task_executors:
             res = yield from task_executors[task.name](task, node_name)
-            return (self.env.now - t_start) if res is None else float(res)
+            duration = (self.env.now - t_start) if res is None else float(res)
+            return duration, node_name
 
-        # 2. Native faas-sim invocation pipeline
+        # 2. Native faas-sim invocation pipeline (targets replica on the scheduled node)
         if getattr(self.env, "faas", None) is not None:
             faas = self.env.faas
             if hasattr(faas, "deployment_service") and faas.deployment_service.exists(task.function_name):
-                # Reuse faas-sim's native FunctionRequest object
-                request = FunctionRequest(name=task.function_name, start=self.env.now, **task.kwargs)
+                target_replica = yield from self._resolve_or_deploy_replica(faas, task.function_name, node_name)
+                actual_node = (
+                    target_replica.node.name
+                    if target_replica is not None and target_replica.node is not None
+                    else node_name
+                )
+                request = FunctionRequest(
+                    name=task.function_name,
+                    start=self.env.now,
+                    replica=target_replica,
+                    **task.kwargs
+                )
                 yield from faas.invoke(request)
-                return self.env.now - t_start
+                return self.env.now - t_start, actual_node
 
         # 3. Default simulated delay
         yield self.env.timeout(self.default_task_duration)
-        return self.env.now - t_start
+        return self.env.now - t_start, node_name
 
-    def _dispatch_outgoing_data(
+    def _resolve_or_deploy_replica(
         self,
-        source_task: str,
-        source_node: str,
-        workflow: WorkflowDAG,
-        placements: Dict[str, str],
-        data_ready_events: Dict[str, Dict[str, simpy.Event]]
-    ) -> Generator[simpy.Event, None, None]:
+        faas,
+        function_name: str,
+        node_name: str,
+        poll_interval: float = 0.1
+    ) -> Generator[simpy.Event, None, Optional[SimFunctionReplica]]:
         """
-        Asynchronously triggers data transfers to all downstream dependent tasks.
+        Finds a RUNNING replica of `function_name` on `node_name`.
+        If none is running on `node_name` and no deployment for `(function_name, node_name)`
+        is currently in progress, instructs `WorkflowSkippyScheduler` (`env.scheduler`)
+        to place a new replica on `node_name`, triggers `faas.scale_up(function_name, 1)`,
+        and waits until the replica transitions to `RUNNING`.
         """
-        downstream = workflow.get_downstream_dependencies(source_task)
-        for dep in downstream:
-            target_node = placements[dep.target_task]
-            ready_event = data_ready_events[dep.target_task][source_task]
+        running_on_node = [
+            r for r in faas.get_replicas(function_name, state=FunctionReplicaState.RUNNING)
+            if r.node is not None and r.node.name == node_name
+        ]
+        if running_on_node:
+            return running_on_node[0]
 
-            # Spawn transfer process concurrently so multiple children receive data in parallel
-            self.env.process(
-                self._transfer_data(
-                    dep=dep,
-                    source_node=source_node,
-                    target_node=target_node,
-                    ready_event=ready_event
-                )
-            )
+        key = (function_name, node_name)
+        started_deployment = False
+        if self._pending_deployments[key] == 0:
+            self._pending_deployments[key] += 1
+            started_deployment = True
+            if isinstance(getattr(self.env, "scheduler", None), WorkflowSkippyScheduler):
+                self.env.scheduler.enqueue_placement(function_name, node_name)
+            yield from faas.scale_up(function_name, 1)
 
-        # Allow immediate continuation
-        yield self.env.timeout(0)
+        try:
+            while True:
+                running_replicas = faas.get_replicas(function_name, state=FunctionReplicaState.RUNNING)
+                for r in running_replicas:
+                    if r.node is not None and r.node.name == node_name:
+                        return r
+                pending = [
+                    r for r in faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
+                    if r.state in (FunctionReplicaState.CONCEIVED, FunctionReplicaState.PENDING)
+                ]
+                if not pending and running_replicas:
+                    return running_replicas[0]
+                yield self.env.timeout(poll_interval)
+        finally:
+            if started_deployment and self._pending_deployments[key] > 0:
+                self._pending_deployments[key] -= 1
 
-    def _transfer_data(
+    def _initialize_placements(
         self,
-        dep: DataDependency,
-        source_node: str,
-        target_node: str,
-        ready_event: simpy.Event
-    ) -> Generator[simpy.Event, None, None]:
-        """
-        Performs the data transfer through the DataTransferController and signals readiness.
-        """
-        mode = dep.mode or DataPassingMode.DIRECT
-        yield from self.controller.transfer(
-            env=self.env,
-            mode=mode,
-            source_node=source_node,
-            target_node=target_node,
-            size_bytes=dep.size_bytes,
-            source_task=dep.source_task,
-            target_task=dep.target_task
-        )
-        ready_event.succeed()
-
-    def _initialize_data_events(self, workflow: WorkflowDAG) -> Dict[str, Dict[str, simpy.Event]]:
-        """
-        Creates a SimPy event for every data dependency: incoming_events[target_task][source_task].
-        """
-        events: Dict[str, Dict[str, simpy.Event]] = collections.defaultdict(dict)
-        for dep in workflow.dependencies:
-            events[dep.target_task][dep.source_task] = self.env.event()
-        return events
-
-    def _resolve_placements(
-        self,
-        workflow: WorkflowDAG,
         task_placements: Optional[Dict[str, str]]
     ) -> Dict[str, str]:
         """
-        Resolves node assignments for each task in the workflow.
-        Delegates to the configured WorkflowScheduler, then applies any manual caller overrides.
+        Validates and returns any explicit caller-specified task placements.
+        Unpinned tasks are left empty and scheduled on-time as the workflow runs.
         """
-        placements: Dict[str, str] = dict(self.scheduler.schedule(workflow, self.env))
-
+        placements: Dict[str, str] = {}
         if task_placements:
             for task_name, target_node in task_placements.items():
                 if self.env.topology and self.env.topology.find_node(target_node) is None:
                     raise ValueError(f"Placement node '{target_node}' for task '{task_name}' not found in topology.")
                 placements[task_name] = target_node
-
         return placements
 
     def _compile_results(
         self,
         workflow: WorkflowDAG,
         t_start: float,
-        task_records: Dict[str, WorkflowTaskExecutionRecord]
+        task_records: Dict[str, WorkflowTaskExecutionRecord],
+        run_transfer_records: List[DataTransferRecord]
     ) -> WorkflowExecutionResult:
         """
-        Assembles the final metrics report for the workflow run.
+        Assembles the final metrics report for this workflow run.
         """
         t_end = self.env.now
         makespan = t_end - t_start
-        all_transfers = self.controller.get_all_records()
+        sorted_transfers = sorted(run_transfer_records, key=lambda r: r.start_time)
 
         total_compute = sum(r.duration for r in task_records.values())
-        total_transfer_time = sum(r.duration for r in all_transfers)
-        total_bytes = sum(r.size_bytes for r in all_transfers)
+        total_transfer_time = sum(r.duration for r in sorted_transfers)
+        total_bytes = sum(r.size_bytes for r in sorted_transfers)
 
         return WorkflowExecutionResult(
             workflow_name=workflow.name,
@@ -322,5 +403,5 @@ class WorkflowEngine:
             total_data_transfer_time=total_transfer_time,
             total_data_bytes_transferred=total_bytes,
             task_records=task_records,
-            transfer_records=all_transfers
+            transfer_records=sorted_transfers
         )

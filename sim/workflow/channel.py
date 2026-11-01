@@ -148,6 +148,7 @@ class DirectDataChannel(DataChannel):
         yield from self._execute_network_flow(env, src, dst, size_bytes, flow_tag="direct_passing")
 
         t_end = env.now
+        effective_mode = DataPassingMode.COLOCATED if src == dst else self.mode
         record = DataTransferRecord(
             source_task=source_task,
             target_task=target_task,
@@ -157,8 +158,8 @@ class DirectDataChannel(DataChannel):
             start_time=t_start,
             end_time=t_end,
             duration=t_end - t_start,
-            mode=self.mode,
-            hops=1 if src != dst else 0
+            mode=effective_mode,
+            hops=0 if src == dst else 1
         )
         self.transfer_records.append(record)
         return record
@@ -229,11 +230,11 @@ class RemoteStorageDataChannel(DataChannel):
         return record
 
 
-class ColocatedDataChannel(DataChannel):
+class ColocatedDataChannel(DirectDataChannel):
     """
     Colocated Channel (Same-Node / VM Storage):
-    Assumes functions are scheduled on the same VM/host. Data transfer is
-    achieved via in-memory buffer or local volume IPC.
+    Enforces that source and target are on the same host (when `strict=True`),
+    then delegates to DirectDataChannel's in-memory transfer path.
     """
 
     def __init__(
@@ -242,7 +243,8 @@ class ColocatedDataChannel(DataChannel):
         min_memory_latency: float = 1e-6,
         strict: bool = True
     ):
-        super().__init__(DataPassingMode.COLOCATED, memory_bandwidth_bytes_per_sec, min_memory_latency)
+        super().__init__(memory_bandwidth_bytes_per_sec, min_memory_latency)
+        self.mode = DataPassingMode.COLOCATED
         self.strict: bool = strict
 
     def transfer(
@@ -257,35 +259,12 @@ class ColocatedDataChannel(DataChannel):
         src: Node = self._resolve_node(env.topology, source_node)
         dst: Node = self._resolve_node(env.topology, target_node)
 
-        if src != dst:
-            if self.strict:
-                raise ValueError(
-                    f"ColocatedDataChannel requires source and target to be on the same node! "
-                    f"Got {src.name} != {dst.name}."
-                )
-            logger.warning(
-                "ColocatedDataChannel placed across different nodes (%s != %s). Falling back to direct flow.",
-                src.name, dst.name
+        if src != dst and self.strict:
+            raise ValueError(
+                f"ColocatedDataChannel requires source and target to be on the same node! "
+                f"Got {src.name} != {dst.name}."
             )
-
-        t_start = env.now
-        yield from self._execute_network_flow(env, src, dst, size_bytes, flow_tag="colocated_memory")
-        t_end = env.now
-
-        record = DataTransferRecord(
-            source_task=source_task,
-            target_task=target_task,
-            source_node=src.name,
-            target_node=dst.name,
-            size_bytes=size_bytes,
-            start_time=t_start,
-            end_time=t_end,
-            duration=t_end - t_start,
-            mode=self.mode,
-            hops=0 if src == dst else 1
-        )
-        self.transfer_records.append(record)
-        return record
+        return (yield from super().transfer(env, src, dst, size_bytes, source_task, target_task))
 
 
 class DataTransferController:

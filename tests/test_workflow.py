@@ -12,7 +12,11 @@ from sim.workflow.channel import (
     DataTransferController,
 )
 from sim.workflow.engine import WorkflowEngine, WorkflowExecutionResult
-from sim.workflow.scheduler import RoundRobinWorkflowScheduler, DataAwareWorkflowScheduler
+from sim.workflow.scheduler import (
+    RoundRobinWorkflowScheduler,
+    DataAwareWorkflowScheduler,
+    WorkflowSkippyScheduler,
+)
 
 
 class TestWorkflowDAG:
@@ -287,7 +291,7 @@ class TestWorkflowEngine:
         assert r_remote.total_data_transfer_time > r_direct.total_data_transfer_time
 
     def test_diamond_parallel_execution(self):
-        """
+        r"""
         Tests diamond DAG:
                A (prep)
               /        \
@@ -448,3 +452,86 @@ class TestWorkflowSchedulers:
         # Data-aware co-locates or selects optimal low-latency links, yielding lower transfer time
         assert res_da.total_data_transfer_time < res_rr.total_data_transfer_time
         assert res_da.makespan < res_rr.makespan
+
+    def test_full_faassim_skippy_workflow_integration(self):
+        """
+        End-to-end integration test with faas-sim's full Simulation, DefaultFaasSystem,
+        and WorkflowSkippyScheduler replacing Skippy (`sim.create_scheduler`).
+        Verifies:
+          1. When nothing is running (`scale_min=0`), triggering a workflow causes
+             `WorkflowSkippyScheduler` to schedule pods onto the exact target nodes
+             chosen by `DataAwareWorkflowScheduler`.
+          2. `DefaultFaasSystem` deploys and executes the replicas on those target nodes.
+          3. A second workflow arrival reuses the warm running replicas on those nodes.
+        """
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+        results = []
+        replica_counts_after_runs = []
+
+        class WorkflowBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                # Deploy functions with scale_min=0 (cold start: no pods running initially)
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                resnet_fd = eb.prepare_resnet_inference_deployment()
+                resnet_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+
+                yield from env.faas.deploy(pi_fd)
+                yield from env.faas.deploy(resnet_fd)
+
+                dag = WorkflowDAG("edge-ai-workflow", default_mode=DataPassingMode.DIRECT)
+                dag.add_task(WorkflowTask(name="preprocess", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="inference", function_name="resnet50-inference"))
+                dag.add_dependency("preprocess", "inference", size_bytes=25 * 1024 * 1024)
+
+                engine = WorkflowEngine(env)
+
+                # First workflow request (triggers cold-start placement via WorkflowSkippyScheduler)
+                res1 = yield from engine.execute_workflow(dag)
+                results.append(res1)
+                replica_counts_after_runs.append(
+                    len(env.faas.get_replicas("python-pi")) + len(env.faas.get_replicas("resnet50-inference"))
+                )
+
+                # Second workflow request (reuses warm replicas on the same scheduled nodes)
+                res2 = yield from engine.execute_workflow(dag)
+                results.append(res2)
+                replica_counts_after_runs.append(
+                    len(env.faas.get_replicas("python-pi")) + len(env.faas.get_replicas("resnet50-inference"))
+                )
+
+        sim = Simulation(topology, WorkflowBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+        assert len(results) == 2
+        res1, res2 = results[0], results[1]
+
+        node_prep = res1.task_records["preprocess"].node_name
+        node_inf = res1.task_records["inference"].node_name
+
+        # Verify actual faas-sim replicas were placed by WorkflowSkippyScheduler on the exact scheduled nodes
+        pi_replicas = sim.env.faas.get_replicas("python-pi")
+        resnet_replicas = sim.env.faas.get_replicas("resnet50-inference")
+        assert len(pi_replicas) == 1
+        assert len(resnet_replicas) == 1
+        assert pi_replicas[0].node.name == node_prep
+        assert resnet_replicas[0].node.name == node_inf
+
+        # Verify each run isolated its own transfer records (no double-counting across runs)
+        assert res1.total_data_bytes_transferred == 25 * 1024 * 1024
+        assert res2.total_data_bytes_transferred == 25 * 1024 * 1024
+
+        # Second run reused warm replicas without spawning extra pods, and ran faster (no image pull cold-start)
+        assert replica_counts_after_runs[0] == 2
+        assert replica_counts_after_runs[1] == 2
+        assert res2.makespan < res1.makespan

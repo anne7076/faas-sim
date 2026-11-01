@@ -25,6 +25,7 @@ from .scheduler import (
     WorkflowScheduler,
     RoundRobinWorkflowScheduler,
     DataAwareWorkflowScheduler,
+    WorkflowSkippyScheduler,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     'WorkflowScheduler',
     'RoundRobinWorkflowScheduler',
     'DataAwareWorkflowScheduler',
+    'WorkflowSkippyScheduler',
 ]

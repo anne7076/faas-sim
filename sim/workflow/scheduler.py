@@ -1,8 +1,22 @@
 import abc
+import collections
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Callable, Deque, Dict, List, Optional, Tuple, Union
 
 from ether.core import Node
+from skippy.core.clustercontext import ClusterContext
+from skippy.core.model import (
+    Container,
+    Node as SkippyNode,
+    Pod,
+    PodSpec,
+    ResourceRequirements,
+    SchedulingResult,
+)
+from skippy.core.predicates import Predicate
+from skippy.core.priorities import Priority
+from skippy.core.scheduler import Scheduler
+from skippy.core.utils import normalize_image_name
 
 from sim.core import Environment
 from sim.workflow.model import WorkflowDAG, WorkflowTask, DataDependency, DataPassingMode
@@ -12,158 +26,99 @@ logger = logging.getLogger(__name__)
 
 class WorkflowScheduler(abc.ABC):
     """
-    Abstract interface for workflow-aware schedulers that map workflow tasks
-    to nodes in the physical edge/cloud topology.
+    Abstract interface for workflow-aware scheduling policies that map workflow tasks
+    to physical nodes in the edge/cloud topology.
     """
 
     @abc.abstractmethod
-    def schedule(self, workflow: WorkflowDAG, env: Environment) -> Dict[str, str]:
+    def schedule_task(
+        self,
+        task: WorkflowTask,
+        workflow: WorkflowDAG,
+        placements: Dict[str, str],
+        env: Environment
+    ) -> str:
         """
-        Computes placement for each task in the workflow.
+        Selects a target node for a single `task` just-in-time (on-time), given the
+        already-resolved node placements of upstream tasks in `placements`.
 
-        :param workflow: The WorkflowDAG to schedule.
-        :param env: The faas-sim simulation environment (provides topology, nodes).
-        :return: A dictionary mapping task_name -> node_name.
+        :param task: The WorkflowTask to schedule now.
+        :param workflow: The WorkflowDAG containing the task and its dependencies.
+        :param placements: Mapping of already-scheduled `task_name -> node_name`.
+        :param env: The faas-sim simulation environment.
+        :return: The selected physical `node_name`.
         """
         pass
 
-
-class RoundRobinWorkflowScheduler(WorkflowScheduler):
-    """
-    Baseline workflow-agnostic scheduler:
-    Places tasks in round-robin fashion across available compute nodes without
-    considering data dependencies, payload sizes, or network topology.
-    """
-
     def schedule(self, workflow: WorkflowDAG, env: Environment) -> Dict[str, str]:
-        available_nodes = self._get_compute_nodes(env)
+        """
+        Computes placements for all tasks in topological order by delegating each
+        step to `schedule_task`.
+        """
         placements: Dict[str, str] = {}
-
-        for idx, task_name in enumerate(workflow.get_execution_order()):
-            node = available_nodes[idx % len(available_nodes)]
-            placements[task_name] = node.name
-
+        for task_name in workflow.get_execution_order():
+            task = workflow.tasks[task_name]
+            placements[task_name] = self.schedule_task(task, workflow, placements, env)
         return placements
 
-    def _get_compute_nodes(self, env: Environment) -> List[Node]:
-        if env.topology is not None:
-            nodes = [n for n in env.topology.get_nodes() if not n.name.startswith("switch")]
-            if nodes:
-                return nodes
-        return [Node("default_node")]
-
-
-class DataAwareWorkflowScheduler(WorkflowScheduler):
-    """
-    Data-Aware Workflow Scheduler:
-    Optimizes function placement across edge and cloud nodes by taking into account
-    intermediate data payload sizes, data passing modes (Direct, Remote Storage, Colocated),
-    and network topology characteristics (bandwidth, latency/RTT).
-
-    Placement Objective:
-      Minimizes intermediate data transfer latency by co-locating tightly coupled tasks
-      or placing them on nodes connected by high-bandwidth / low-latency direct links,
-      with optional load-balancing weighting.
-    """
-
-    def __init__(
-        self,
-        storage_node: Optional[Union[str, Node]] = None,
-        network_weight: float = 1.0,
-        load_balance_weight: float = 0.0,
-        max_tasks_per_node: Optional[int] = None
-    ):
+    def _get_compute_nodes(self, env: Environment, task: Optional[WorkflowTask] = None) -> List[Node]:
         """
-        :param storage_node: Central storage node reference (for Remote Storage estimates).
-        :param network_weight: Weight given to network transfer cost in candidate scoring.
-        :param load_balance_weight: Weight given to spreading load across nodes (penalty per existing task).
-        :param max_tasks_per_node: Optional strict limit on tasks allowed per node.
+        Returns feasible compute nodes from the environment.
+        When running inside a full faas-sim Simulation (env.cluster and env.scheduler exist),
+        uses Skippy's predicates (CPU/RAM resources, node labels, storage exclusion) to filter
+        out infeasible nodes for the given task's function deployment without mutating global pod counters.
         """
-        self.storage_node_ref: Optional[Union[str, Node]] = storage_node
-        self.network_weight: float = network_weight
-        self.load_balance_weight: float = load_balance_weight
-        self.max_tasks_per_node: Optional[int] = max_tasks_per_node
+        if env.topology is None:
+            return [Node("default_node")]
 
-    def schedule(self, workflow: WorkflowDAG, env: Environment) -> Dict[str, str]:
-        execution_order = workflow.get_execution_order()
-        candidate_nodes = self._get_compute_nodes(env)
-        placements: Dict[str, str] = {}
-        node_task_count: Dict[str, int] = {n.name: 0 for n in candidate_nodes}
+        all_ether_nodes = [
+            n for n in env.topology.get_nodes()
+            if not n.name.startswith("switch") and "registry" not in n.name
+        ]
+        if not all_ether_nodes:
+            return [Node("default_node")]
 
-        # Resolve storage node if specified
-        storage_node = self._resolve_node(env, self.storage_node_ref) if self.storage_node_ref else None
+        if (
+            task is not None
+            and getattr(env, "cluster", None) is not None
+            and getattr(env, "scheduler", None) is not None
+            and getattr(env, "faas", None) is not None
+            and hasattr(env.faas, "deployment_service")
+            and env.faas.deployment_service.exists(task.function_name)
+        ):
+            fd = env.faas.deployment_service.get_by_name(task.function_name)
+            containers = fd.deployment_ranking.containers if fd.deployment_ranking else fd.fn_containers
+            if containers:
+                probe_pod = self._build_probe_pod(fd.name, containers[0])
+                warm_node_names = {
+                    r.node.name
+                    for r in env.faas.get_replicas(task.function_name)
+                    if r.node is not None
+                }
+                feasible_names = warm_node_names | {
+                    s_node.name
+                    for s_node in env.cluster.list_nodes()
+                    if env.scheduler.passes_predicates(probe_pod, s_node)
+                }
+                feasible_ether_nodes = [n for n in all_ether_nodes if n.name in feasible_names]
+                if feasible_ether_nodes:
+                    return feasible_ether_nodes
 
-        for task_name in execution_order:
-            incoming_deps = workflow.get_incoming_dependencies(task_name)
+        return all_ether_nodes
 
-            # Filter candidates respecting max_tasks_per_node if specified
-            eligible_candidates = [
-                n for n in candidate_nodes
-                if self.max_tasks_per_node is None or node_task_count[n.name] < self.max_tasks_per_node
-            ]
-            if not eligible_candidates:
-                eligible_candidates = candidate_nodes  # Fallback if all nodes reached threshold
-
-            # Root tasks: place on the candidate with the lowest current load
-            if not incoming_deps:
-                best_node = min(eligible_candidates, key=lambda n: node_task_count[n.name])
-                placements[task_name] = best_node.name
-                node_task_count[best_node.name] += 1
-                logger.debug("[DataAwareScheduler] Placed root task '%s' on '%s'", task_name, best_node.name)
-                continue
-
-            # Dependent tasks: evaluate each candidate node for network transfer cost + load penalty
-            best_node = None
-            best_score = float("inf")
-
-            for candidate in eligible_candidates:
-                total_transfer_cost = 0.0
-
-                for dep in incoming_deps:
-                    parent_node_name = placements[dep.source_task]
-                    parent_node = (
-                        env.topology.find_node(parent_node_name)
-                        if env.topology is not None else None
-                    )
-                    if parent_node is None:
-                        parent_node = Node(parent_node_name)
-
-                    mode = dep.mode or workflow.default_mode
-
-                    cost = self._estimate_transfer_time(
-                        env=env,
-                        src_node=parent_node,
-                        dst_node=candidate,
-                        size_bytes=dep.size_bytes,
-                        mode=mode,
-                        storage_node=storage_node
-                    )
-                    total_transfer_cost += cost
-
-                # Composite score: network transfer cost + load balancing penalty
-                load_penalty = node_task_count[candidate.name] * self.load_balance_weight
-                candidate_score = (total_transfer_cost * self.network_weight) + load_penalty
-
-                logger.debug(
-                    "[DataAwareScheduler] Task '%s' candidate '%s': transfer=%.6fs, load_penalty=%.4f -> score=%.6f",
-                    task_name, candidate.name, total_transfer_cost, load_penalty, candidate_score
-                )
-
-                if candidate_score < best_score:
-                    best_score = candidate_score
-                    best_node = candidate
-
-            if best_node is None:
-                best_node = eligible_candidates[0]
-
-            placements[task_name] = best_node.name
-            node_task_count[best_node.name] += 1
-            logger.info(
-                "[DataAwareScheduler] Placed task '%s' on '%s' (score: %.4f)",
-                task_name, best_node.name, best_score
-            )
-
-        return placements
+    @staticmethod
+    def _build_probe_pod(fn_name: str, fn_container) -> Pod:
+        """
+        Constructs a lightweight Pod for Skippy predicate evaluation without mutating
+        `sim.skippy.pod_counters`.
+        """
+        requests = fn_container.resource_config.get_resource_requirements()
+        spec = PodSpec()
+        spec.containers = [Container(fn_container.image, ResourceRequirements(requests))]
+        spec.labels = fn_container.labels.copy()
+        pod = Pod(f"probe-pod-{fn_name}", "faas-sim")
+        pod.spec = spec
+        return pod
 
     def _estimate_transfer_time(
         self,
@@ -172,29 +127,23 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
         dst_node: Node,
         size_bytes: int,
         mode: DataPassingMode,
-        storage_node: Optional[Node]
+        storage_node: Optional[Node] = None
     ) -> float:
         """
-        Estimates the transfer time in seconds for size_bytes from src_node to dst_node.
+        Estimates the transfer time in seconds for `size_bytes` from `src_node` to `dst_node`.
         """
         if size_bytes <= 0:
             return 1e-6
 
-        # Case 1: Colocated (same node)
         if src_node == dst_node or mode == DataPassingMode.COLOCATED:
-            # In-memory bandwidth approx 1 GB/s
             return size_bytes / 1e9
 
-        # Case 2: Remote Storage (2 hops: src -> storage -> dst)
         if mode == DataPassingMode.REMOTE_STORAGE:
-            if storage_node is None:
-                # Default fallback penalty if no storage node defined
-                storage_node = src_node
-            hop1 = self._estimate_flow_time(env, src_node, storage_node, size_bytes)
-            hop2 = self._estimate_flow_time(env, storage_node, dst_node, size_bytes)
+            effective_storage = storage_node or src_node
+            hop1 = self._estimate_flow_time(env, src_node, effective_storage, size_bytes)
+            hop2 = self._estimate_flow_time(env, effective_storage, dst_node, size_bytes)
             return hop1 + hop2
 
-        # Case 3: Direct Peer-to-Peer (1 hop: src -> dst)
         return self._estimate_flow_time(env, src_node, dst_node, size_bytes)
 
     def _estimate_flow_time(self, env: Environment, src: Node, dst: Node, size_bytes: int) -> float:
@@ -207,11 +156,10 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
 
         try:
             route = env.topology.route(src, dst)
-            rtt_latency = (route.rtt / 1000.0) / 2.0  # One-way latency in seconds
+            rtt_latency = (route.rtt / 1000.0) / 2.0
 
             if route.hops:
-                # In ether, link bandwidth is in bytes/second
-                bottleneck_bw = min(getattr(link, 'bandwidth', 1e8) for link in route.hops)
+                bottleneck_bw = min(getattr(link, "bandwidth", 1e8) for link in route.hops)
                 if bottleneck_bw <= 0:
                     bottleneck_bw = 1e6
                 transmission_time = size_bytes / bottleneck_bw
@@ -220,20 +168,262 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
 
             return rtt_latency + transmission_time
         except Exception as e:
-            logger.warning("[DataAwareScheduler] Failed to route between %s and %s: %s", src.name, dst.name, e)
-            return 0.1  # Fallback estimate
+            logger.warning("[WorkflowScheduler] Failed to route between %s and %s: %s", src.name, dst.name, e)
+            return 0.1
 
-    def _get_compute_nodes(self, env: Environment) -> List[Node]:
-        """Filters compute nodes from the topology (excluding switches)."""
-        if env.topology is not None:
-            nodes = [n for n in env.topology.get_nodes() if not n.name.startswith("switch")]
-            if nodes:
-                return nodes
-        return [Node("default_node")]
-
-    def _resolve_node(self, env: Environment, node_ref: Union[str, Node]) -> Optional[Node]:
+    @staticmethod
+    def _resolve_node(env: Environment, node_ref: Union[str, Node]) -> Optional[Node]:
         if isinstance(node_ref, Node):
             return node_ref
         if env.topology is not None:
             return env.topology.find_node(node_ref)
         return None
+
+
+class RoundRobinWorkflowScheduler(WorkflowScheduler):
+    """
+    Baseline workflow-agnostic scheduler:
+    Places tasks in round-robin fashion across feasible compute nodes without
+    considering data dependencies, payload sizes, or network topology.
+    """
+
+    def schedule_task(
+        self,
+        task: WorkflowTask,
+        workflow: WorkflowDAG,
+        placements: Dict[str, str],
+        env: Environment
+    ) -> str:
+        available_nodes = self._get_compute_nodes(env, task)
+        idx = len(placements)
+        return available_nodes[idx % len(available_nodes)].name
+
+
+class DataAwareWorkflowScheduler(WorkflowScheduler):
+    """
+    Data-Aware Workflow Scheduler:
+    Optimizes function placement across edge and cloud nodes by taking into account
+    intermediate data payload sizes, data passing modes, and network topology
+    characteristics (bandwidth, latency/RTT).
+
+    Placement Objective:
+      Minimizes intermediate data transfer latency by co-locating tightly coupled tasks
+      or placing them on nodes connected by high-bandwidth / low-latency direct links,
+      with optional load-balancing weighting.
+    """
+
+    def __init__(
+        self,
+        storage_node: Optional[Union[str, Node]] = None,
+        network_weight: float = 1.0,
+        load_balance_weight: float = 0.0,
+        cold_start_penalty: float = 0.5,
+        max_tasks_per_node: Optional[int] = None
+    ):
+        self.storage_node_ref: Optional[Union[str, Node]] = storage_node
+        self.network_weight: float = network_weight
+        self.load_balance_weight: float = load_balance_weight
+        self.cold_start_penalty: float = cold_start_penalty
+        self.max_tasks_per_node: Optional[int] = max_tasks_per_node
+
+    def schedule_task(
+        self,
+        task: WorkflowTask,
+        workflow: WorkflowDAG,
+        placements: Dict[str, str],
+        env: Environment
+    ) -> str:
+        candidate_nodes = self._get_compute_nodes(env, task)
+        incoming_deps = workflow.get_incoming_dependencies(task.name)
+        storage_node = self._resolve_node(env, self.storage_node_ref) if self.storage_node_ref else None
+
+        # Identify nodes that already host a warm RUNNING replica for this task's function
+        warm_nodes = set()
+        if getattr(env, "faas", None) is not None and hasattr(env.faas, "get_replicas"):
+            warm_nodes = {
+                r.node.name
+                for r in env.faas.get_replicas(task.function_name)
+                if r.node is not None
+            }
+
+        # Count tasks already placed on each node in this workflow
+        node_task_count: Dict[str, int] = collections.Counter(placements.values())
+
+        eligible_candidates = [
+            n for n in candidate_nodes
+            if self.max_tasks_per_node is None or node_task_count[n.name] < self.max_tasks_per_node
+        ]
+        if not eligible_candidates:
+            eligible_candidates = candidate_nodes
+
+        # Root tasks: prefer warm nodes if available, otherwise lowest current task count
+        if not incoming_deps:
+            best_node = min(
+                eligible_candidates,
+                key=lambda n: (
+                    0.0 if (not warm_nodes or n.name in warm_nodes) else self.cold_start_penalty,
+                    node_task_count[n.name]
+                )
+            )
+            logger.debug("[DataAwareScheduler] Placed root task '%s' on '%s'", task.name, best_node.name)
+            return best_node.name
+
+        best_node = None
+        best_score = float("inf")
+
+        for candidate in eligible_candidates:
+            total_transfer_cost = 0.0
+
+            for dep in incoming_deps:
+                parent_node_name = placements.get(dep.source_task)
+                if parent_node_name is None:
+                    continue
+                parent_node = (
+                    env.topology.find_node(parent_node_name)
+                    if env.topology is not None else None
+                )
+                if parent_node is None:
+                    parent_node = Node(parent_node_name)
+
+                mode = dep.mode or workflow.default_mode
+                cost = self._estimate_transfer_time(
+                    env=env,
+                    src_node=parent_node,
+                    dst_node=candidate,
+                    size_bytes=dep.size_bytes,
+                    mode=mode,
+                    storage_node=storage_node
+                )
+                total_transfer_cost += cost
+
+            load_penalty = node_task_count[candidate.name] * self.load_balance_weight
+            cold_penalty = (
+                self.cold_start_penalty
+                if (warm_nodes and candidate.name not in warm_nodes)
+                else 0.0
+            )
+            candidate_score = (total_transfer_cost * self.network_weight) + load_penalty + cold_penalty
+
+            if candidate_score < best_score:
+                best_score = candidate_score
+                best_node = candidate
+
+        if best_node is None:
+            best_node = eligible_candidates[0]
+
+        logger.info(
+            "[DataAwareScheduler] Placed task '%s' on '%s' (score: %.4f)",
+            task.name, best_node.name, best_score
+        )
+        return best_node.name
+
+
+class WorkflowSkippyScheduler(Scheduler):
+    """
+    Workflow-Aware Skippy Scheduler Extension.
+
+    Extends Skippy's cluster-wide `Scheduler` (`env.scheduler` in faas-sim) so that:
+    1. All Skippy hard-constraint predicates (CPU/RAM fit, node selectors, storage exclusion)
+       and cluster state tracking (`place_pod_on_node`, `needed_images`) are preserved.
+    2. When a pod is deployed/scaled for a workflow task, it places the pod on the node
+       selected by the `WorkflowScheduler` policy (if feasible), falling back to standard
+       Skippy priority scoring for non-workflow pods or if the target node is saturated.
+    """
+
+    def __init__(
+        self,
+        cluster_context: ClusterContext,
+        percentage_of_nodes_to_score: int = 100,
+        predicates: Optional[List[Predicate]] = None,
+        priorities: Optional[List[Tuple[float, Priority]]] = None
+    ):
+        super().__init__(
+            cluster_context=cluster_context,
+            percentage_of_nodes_to_score=percentage_of_nodes_to_score,
+            predicates=predicates,
+            priorities=priorities
+        )
+        self._placement_queues: Dict[str, Deque[str]] = collections.defaultdict(collections.deque)
+
+    @staticmethod
+    def create(
+        percentage_of_nodes_to_score: int = 100,
+        predicates: Optional[List[Predicate]] = None,
+        priorities: Optional[List[Tuple[float, Priority]]] = None
+    ) -> Callable[[Environment], 'WorkflowSkippyScheduler']:
+        """
+        Factory helper for injecting into `sim.create_scheduler`:
+            sim.create_scheduler = WorkflowSkippyScheduler.create()
+        """
+        def _factory(env: Environment) -> 'WorkflowSkippyScheduler':
+            return WorkflowSkippyScheduler(
+                env.cluster,
+                percentage_of_nodes_to_score=percentage_of_nodes_to_score,
+                predicates=predicates,
+                priorities=priorities
+            )
+        return _factory
+
+    def enqueue_placement(self, function_name: str, node_name: str) -> None:
+        """
+        Registers a target node decision from the WorkflowScheduler for the next pod
+        of `function_name` that enters Skippy's scheduling queue.
+        """
+        self._placement_queues[function_name].append(node_name)
+
+    def schedule(self, pod: Pod) -> SchedulingResult:
+        """
+        Schedules a Pod onto a cluster node.
+        If a workflow placement target is queued for this pod's function and passes
+        Skippy's predicates, places the pod on that target node; otherwise delegates
+        to standard Skippy scheduling.
+        """
+        fn_name = self._extract_function_name(pod)
+        queue = self._placement_queues.get(fn_name)
+
+        if queue:
+            target_node_name = queue.popleft()
+            nodes = self.cluster_context.list_nodes()
+            feasible_nodes = [node for node in nodes if self.passes_predicates(pod, node)]
+
+            target_host: Optional[SkippyNode] = next(
+                (node for node in feasible_nodes if node.name == target_node_name),
+                None
+            )
+
+            if target_host is not None:
+                needed_images = []
+                host_images = self.cluster_context.images_on_nodes[target_host.name]
+                for container in pod.spec.containers:
+                    if normalize_image_name(container.image) not in host_images:
+                        needed_images.append(normalize_image_name(container.image))
+
+                self.cluster_context.place_pod_on_node(pod, target_host)
+                logger.info(
+                    "[WorkflowSkippyScheduler] Placed workflow pod '%s' onto target node '%s'",
+                    pod.name, target_host.name
+                )
+                return SchedulingResult(
+                    suggested_host=target_host,
+                    feasible_nodes=len(feasible_nodes),
+                    needed_images=needed_images
+                )
+
+            logger.warning(
+                "[WorkflowSkippyScheduler] Target node '%s' for pod '%s' failed predicates or not found; "
+                "falling back to standard Skippy scoring.",
+                target_node_name, pod.name
+            )
+
+        return super().schedule(pod)
+
+    @staticmethod
+    def _extract_function_name(pod: Pod) -> str:
+        """
+        Extracts the function deployment name from a faas-sim Pod name (`pod-{fn_name}-{cnt}`).
+        """
+        if pod.name.startswith("pod-"):
+            parts = pod.name.split("-")
+            if len(parts) >= 3:
+                return "-".join(parts[1:-1])
+        return pod.name
