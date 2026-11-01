@@ -13,8 +13,10 @@ from sim.workflow.channel import (
 )
 from sim.workflow.engine import WorkflowEngine, WorkflowExecutionResult
 from sim.workflow.scheduler import (
+    WorkflowScheduler,
     RoundRobinWorkflowScheduler,
     DataAwareWorkflowScheduler,
+    MakespanWorkflowScheduler,
     WorkflowSkippyScheduler,
 )
 
@@ -535,3 +537,347 @@ class TestWorkflowSchedulers:
         assert replica_counts_after_runs[0] == 2
         assert replica_counts_after_runs[1] == 2
         assert res2.makespan < res1.makespan
+
+
+class TestArchitecturalInvariants:
+    """
+    Automated self-checking verification suite enforcing all invariants from
+    the Conceptual & Verification Guide (Invariants I-A1 through I-D).
+    """
+
+    def test_invariant_ia2_strict_causal_ordering(self):
+        """
+        I-A2: For every dependency (u -> v),
+        task_records[u].end_time <= transfer(u->v).start_time <= transfer(u->v).end_time <= task_records[v].start_time
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+
+        dag = WorkflowDAG("causal-dag", default_mode=DataPassingMode.DIRECT)
+        for name in ["A", "B", "C", "D"]:
+            dag.add_task(WorkflowTask(name=name, function_name=f"fn-{name}"))
+        dag.add_dependency("A", "B", size_bytes=2 * 1024 * 1024)
+        dag.add_dependency("A", "C", size_bytes=4 * 1024 * 1024)
+        dag.add_dependency("B", "D", size_bytes=1 * 1024 * 1024)
+        dag.add_dependency("C", "D", size_bytes=3 * 1024 * 1024)
+
+        engine = WorkflowEngine(env, scheduler=RoundRobinWorkflowScheduler(), default_task_duration=0.25)
+        results = []
+
+        def run():
+            res = yield from engine.execute_workflow(dag)
+            results.append(res)
+
+        env.process(run())
+        env.run()
+
+        res = results[0]
+        assert len(res.transfer_records) == 4
+        for tr in res.transfer_records:
+            u_rec = res.task_records[tr.source_task]
+            v_rec = res.task_records[tr.target_task]
+            assert u_rec.end_time <= tr.start_time + 1e-9
+            assert tr.start_time <= tr.end_time
+            assert tr.end_time <= v_rec.start_time + 1e-9
+
+    def test_invariant_ib2_true_on_time_scheduling(self):
+        """
+        I-B2: A task v must never be scheduled before all of its upstream parents {u_i}
+        have finished executing and recorded their actual execution nodes in placements.
+        Tests an unbalanced join DAG: A -> B -> C -> D and A -> D.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+
+        schedule_timestamps = {}
+        seen_placements_at_schedule = {}
+
+        class RecordingScheduler(DataAwareWorkflowScheduler):
+            def schedule_task(self, task, workflow, placements, env):
+                schedule_timestamps[task.name] = env.now
+                seen_placements_at_schedule[task.name] = dict(placements)
+                return super().schedule_task(task, workflow, placements, env)
+
+        dag = WorkflowDAG("unbalanced-join", default_mode=DataPassingMode.DIRECT)
+        for name in ["A", "B", "C", "D"]:
+            dag.add_task(WorkflowTask(name=name, function_name=f"fn-{name}"))
+        dag.add_dependency("A", "B", size_bytes=1024)
+        dag.add_dependency("B", "C", size_bytes=1024)
+        dag.add_dependency("C", "D", size_bytes=10 * 1024 * 1024)
+        dag.add_dependency("A", "D", size_bytes=1024)
+
+        engine = WorkflowEngine(env, scheduler=RecordingScheduler(), default_task_duration=0.3)
+        results = []
+
+        def run():
+            res = yield from engine.execute_workflow(dag)
+            results.append(res)
+
+        env.process(run())
+        env.run()
+
+        res = results[0]
+        # Root task A is scheduled at t=0
+        assert schedule_timestamps["A"] == pytest.approx(0.0)
+        # Task D depends on both A and C, so D must only be scheduled after C finishes computing
+        assert schedule_timestamps["D"] == pytest.approx(res.task_records["C"].end_time)
+        assert schedule_timestamps["D"] > res.task_records["A"].end_time
+        assert "A" in seen_placements_at_schedule["D"]
+        assert "C" in seen_placements_at_schedule["D"]
+
+    def test_invariant_ib3_zero_side_effects_on_pod_counters(self):
+        """
+        I-B3: Evaluating candidate nodes via Skippy predicates (_build_probe_pod)
+        must never mutate sim.skippy.pod_counters.
+        """
+        import sim.skippy as sim_skippy
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+
+        class ProbeBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.fn.name = "python-pi-probe-only"
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                yield from env.faas.deploy(pi_fd)
+
+                dag = WorkflowDAG("probe-test")
+                dag.add_task(WorkflowTask(name="t1", function_name="python-pi-probe-only"))
+                dag.add_task(WorkflowTask(name="t2", function_name="python-pi-probe-only"))
+                dag.add_dependency("t1", "t2", size_bytes=1024)
+
+                assert "python-pi-probe-only" not in sim_skippy.pod_counters
+                scheduler = DataAwareWorkflowScheduler()
+                _ = scheduler.schedule(dag, env)
+                # Verify pod_counters was not touched by probing
+                assert "python-pi-probe-only" not in sim_skippy.pod_counters
+
+        sim = Simulation(topology, ProbeBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+    def test_invariant_ib5_fallback_actual_node_synchronization(self):
+        """
+        I-B5: If planned_node becomes saturated and Skippy places the replica on a
+        fallback node actual_node, placements[task.name] and task_records[task.name].node_name
+        must be updated to actual_node so downstream data transfers originate from actual_node.
+        """
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+        rpi_node_name = [n.name for n in topology.get_nodes() if "rpi" in n.name][0]
+        results = []
+
+        class FallbackBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                yield from env.faas.deploy(pi_fd)
+
+                # Deliberately exhaust allocatable CPU on rpi_node_name in Skippy's cluster context
+                saturated_node = next(n for n in env.cluster.list_nodes() if n.name == rpi_node_name)
+                saturated_node.allocatable.cpu_millis = 0
+
+                dag = WorkflowDAG("fallback-dag", default_mode=DataPassingMode.DIRECT)
+                dag.add_task(WorkflowTask(name="T1", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="T2", function_name="python-pi"))
+                dag.add_dependency("T1", "T2", size_bytes=1024 * 1024)
+
+                engine = WorkflowEngine(env)
+                # Pin T1 to saturated rpi_node_name; Skippy must fall back to a feasible node
+                res = yield from engine.execute_workflow(dag, task_placements={"T1": rpi_node_name})
+                results.append(res)
+
+        sim = Simulation(topology, FallbackBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+        res = results[0]
+        actual_t1_node = res.task_records["T1"].node_name
+        assert actual_t1_node != rpi_node_name
+        # Downstream transfer T1 -> T2 must originate from actual_t1_node, not rpi_node_name
+        tr = res.transfer_records[0]
+        assert tr.source_node == actual_t1_node
+
+    def test_invariant_ib6_concurrent_cold_start_isolation(self):
+        """
+        I-B6: Two parallel tasks invoking the same function_name on different nodes at t=0
+        must each scale up a replica on their respective node, while two tasks targeting
+        the same node share the pending deployment.
+        """
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+        nuc_node = [n.name for n in topology.get_nodes() if "nuc" in n.name][0]
+        server_node = [n.name for n in topology.get_nodes() if "server" in n.name][0]
+        results = []
+
+        class ConcurrentColdStartBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                yield from env.faas.deploy(pi_fd)
+
+                dag = WorkflowDAG("concurrent-roots", default_mode=DataPassingMode.DIRECT)
+                dag.add_task(WorkflowTask(name="R1", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="R2", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="R3", function_name="python-pi"))
+
+                engine = WorkflowEngine(env)
+                # R1 and R2 share nuc_node, while R3 targets server_node concurrently at t=0
+                res = yield from engine.execute_workflow(
+                    dag,
+                    task_placements={"R1": nuc_node, "R2": nuc_node, "R3": server_node}
+                )
+                results.append(res)
+
+        sim = Simulation(topology, ConcurrentColdStartBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+        res = results[0]
+        assert res.task_records["R1"].node_name == nuc_node
+        assert res.task_records["R2"].node_name == nuc_node
+        assert res.task_records["R3"].node_name == server_node
+
+        # Exactly 2 replicas should exist: 1 on nuc_node (shared by R1 & R2) and 1 on server_node (for R3)
+        replicas = sim.env.faas.get_replicas("python-pi")
+        replica_nodes = sorted(r.node.name for r in replicas)
+        assert replica_nodes == sorted([nuc_node, server_node])
+
+    def test_invariant_ic1_direct_collapses_to_colocated_on_same_host(self):
+        """
+        I-C1: DirectDataChannel automatically collapses to DataPassingMode.COLOCATED (hops=0)
+        when source_node == target_node.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+        rpi_node = [n.name for n in env.topology.get_nodes() if "rpi" in n.name][0]
+
+        ch = DirectDataChannel()
+        records = []
+
+        def run():
+            rec = yield from ch.transfer(
+                env, source_node=rpi_node, target_node=rpi_node,
+                size_bytes=5 * 1024 * 1024, source_task="t1", target_task="t2"
+            )
+            records.append(rec)
+
+        env.process(run())
+        env.run()
+
+        rec = records[0]
+        assert rec.mode == DataPassingMode.COLOCATED
+        assert rec.hops == 0
+
+    def test_invariant_id_makespan_scheduler(self):
+        """
+        I-D: Verifies multi-objective behavior of MakespanWorkflowScheduler vs DataAwareWorkflowScheduler.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        rpi_node = [n.name for n in env.topology.get_nodes() if "rpi" in n.name][0]
+
+        # Makespan vs DataAware on compute-heavy task with tiny payload (10 KB) from slow rpi_node
+        dag = WorkflowDAG("compute-heavy-dag", default_mode=DataPassingMode.DIRECT)
+        dag.add_task(WorkflowTask(name="sensor", function_name="fn-sensor"))
+        dag.add_task(
+            WorkflowTask(
+                name="heavy_compute",
+                function_name="fn-heavy",
+                estimated_duration=10.0
+            )
+        )
+        dag.add_dependency("sensor", "heavy_compute", size_bytes=10 * 1024)  # 10 KB
+
+        da_scheduler = DataAwareWorkflowScheduler()
+        ms_scheduler = MakespanWorkflowScheduler()
+
+        da_node = da_scheduler.schedule_task(
+            dag.tasks["heavy_compute"], dag, {"sensor": rpi_node}, env
+        )
+        ms_node = ms_scheduler.schedule_task(
+            dag.tasks["heavy_compute"], dag, {"sensor": rpi_node}, env
+        )
+
+        # DataAware co-locates on slow rpi_node (4000 cpu_millis) to save 10 KB transfer
+        assert da_node == rpi_node
+        # Makespan offloads to a high-capacity server/tx2 node because compute speedup >> 10 KB transfer time
+        ms_ether_node = env.topology.find_node(ms_node)
+        rpi_ether_node = env.topology.find_node(rpi_node)
+        assert ms_ether_node.capacity.cpu_millis > rpi_ether_node.capacity.cpu_millis
+
+    def test_invariant_ie1_root_task_downstream_colocation_feasibility(self):
+        """
+        E-1: When a root task (`python-pi`) has a heavy outgoing dependency to a constrained
+        downstream task (`resnet50-inference` requiring 1024Mi RAM), `DataAwareWorkflowScheduler`
+        places the root task on a node that can also host the downstream consumer so both tasks
+        co-locate with 0 network hops (`DataPassingMode.COLOCATED`).
+        """
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+        results = []
+
+        class ColocationBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                resnet_fd = eb.prepare_resnet_inference_deployment()
+                resnet_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+
+                yield from env.faas.deploy(pi_fd)
+                yield from env.faas.deploy(resnet_fd)
+
+                dag = WorkflowDAG("coloc-dag", default_mode=DataPassingMode.DIRECT)
+                dag.add_task(WorkflowTask(name="preprocess", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="inference", function_name="resnet50-inference"))
+                dag.add_dependency("preprocess", "inference", size_bytes=20 * 1024 * 1024)
+
+                engine = WorkflowEngine(env, scheduler=DataAwareWorkflowScheduler())
+                res = yield from engine.execute_workflow(dag)
+                results.append(res)
+
+        sim = Simulation(topology, ColocationBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+        res = results[0]
+        assert res.task_records["preprocess"].node_name == res.task_records["inference"].node_name
+        assert res.transfer_records[0].mode == DataPassingMode.COLOCATED
+        assert res.transfer_records[0].hops == 0
+
+

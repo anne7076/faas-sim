@@ -1,7 +1,7 @@
 import collections
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Counter, Dict, Generator, List, Optional, Tuple, Union
+from typing import Callable, Counter, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import simpy
 from ether.core import Node
@@ -91,7 +91,9 @@ class WorkflowEngine:
         self.controller: DataTransferController = controller or DataTransferController(storage_node=storage_node)
         self.scheduler: WorkflowScheduler = scheduler or DataAwareWorkflowScheduler(storage_node=storage_node)
         self.default_task_duration: float = default_task_duration
-        self._pending_deployments: Counter[Tuple[str, str]] = collections.Counter()
+        self._pending_waiters: Counter[Tuple[str, str]] = collections.Counter()
+        self._pending_replicas: Dict[Tuple[str, str], Optional[SimFunctionReplica]] = {}
+        self._claimed_replica_ids: Set[str] = set()
 
     def execute_workflow(
         self,
@@ -300,11 +302,12 @@ class WorkflowEngine:
                     if target_replica is not None and target_replica.node is not None
                     else node_name
                 )
+                req_kwargs = {k: v for k, v in task.kwargs.items() if k in ("size", "client")}
                 request = FunctionRequest(
                     name=task.function_name,
                     start=self.env.now,
                     replica=target_replica,
-                    **task.kwargs
+                    **req_kwargs
                 )
                 yield from faas.invoke(request)
                 return self.env.now - t_start, actual_node
@@ -334,31 +337,62 @@ class WorkflowEngine:
         if running_on_node:
             return running_on_node[0]
 
+        starting_on_node = [
+            r for r in faas.get_replicas(function_name, running=False)
+            if r.node is not None and r.node.name == node_name and r.state == FunctionReplicaState.PENDING
+        ]
+
         key = (function_name, node_name)
-        started_deployment = False
-        if self._pending_deployments[key] == 0:
-            self._pending_deployments[key] += 1
-            started_deployment = True
-            if isinstance(getattr(self.env, "scheduler", None), WorkflowSkippyScheduler):
-                self.env.scheduler.enqueue_placement(function_name, node_name)
-            yield from faas.scale_up(function_name, 1)
+        self._pending_waiters[key] += 1
 
         try:
+            if self._pending_waiters[key] == 1 and not starting_on_node:
+                before_ids = {
+                    r.replica_id
+                    for r in faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
+                }
+                if isinstance(getattr(self.env, "scheduler", None), WorkflowSkippyScheduler):
+                    self.env.scheduler.enqueue_placement(function_name, node_name)
+                yield from faas.scale_up(function_name, 1)
+                all_reps = faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
+                new_reps = [
+                    r for r in all_reps
+                    if r.replica_id not in before_ids and r.replica_id not in self._claimed_replica_ids
+                ]
+                if new_reps:
+                    claimed = new_reps[0]
+                    self._claimed_replica_ids.add(claimed.replica_id)
+                    self._pending_replicas[key] = claimed
+                else:
+                    self._pending_replicas[key] = None
+
             while True:
                 running_replicas = faas.get_replicas(function_name, state=FunctionReplicaState.RUNNING)
                 for r in running_replicas:
                     if r.node is not None and r.node.name == node_name:
                         return r
+
+                tracked = self._pending_replicas.get(key)
+                if tracked is not None and tracked.state == FunctionReplicaState.RUNNING:
+                    return tracked
+
                 pending = [
                     r for r in faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
                     if r.state in (FunctionReplicaState.CONCEIVED, FunctionReplicaState.PENDING)
                 ]
-                if not pending and running_replicas:
-                    return running_replicas[0]
+                if not pending and key in self._pending_replicas:
+                    if running_replicas:
+                        return running_replicas[-1]
+                    raise RuntimeError(
+                        f"Failed to schedule or start any replica for function '{function_name}' "
+                        f"(requested node '{node_name}')."
+                    )
                 yield self.env.timeout(poll_interval)
         finally:
-            if started_deployment and self._pending_deployments[key] > 0:
-                self._pending_deployments[key] -= 1
+            self._pending_waiters[key] -= 1
+            if self._pending_waiters[key] <= 0:
+                self._pending_waiters.pop(key, None)
+                self._pending_replicas.pop(key, None)
 
     def _initialize_placements(
         self,

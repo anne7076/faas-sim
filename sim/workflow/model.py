@@ -21,6 +21,7 @@ class WorkflowTask:
     name: str
     function_name: str
     image: Optional[str] = None
+    estimated_duration: Optional[float] = None
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __hash__(self):
