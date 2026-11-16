@@ -65,16 +65,7 @@ class HeterogeneousFunctionSimulator(DockerDeploySimMixin, DummySimulator):
 
         base_duration = self.BASE_DURATIONS.get(request.name, 1.0)
         ether_node = replica.node.ether_node
-        node_cpu = float(getattr(ether_node.capacity, "cpu_millis", 4000.0))
-        effective_cpu = min(max(node_cpu, 1000.0), 16000.0)
-
-        labels = getattr(ether_node, "labels", {}) or {}
-        if "ether.edgerun.io/capabilities/cuda" in labels:
-            effective_cpu *= 1.5
-        elif labels.get("ether.edgerun.io/type") == "sbc":
-            effective_cpu *= 0.5
-
-        speedup_ratio = 4000.0 / effective_cpu
+        speedup_ratio = WorkflowScheduler.compute_node_speedup_ratio(ether_node, reference_cpu_millis=4000.0)
         contention_multiplier = 1.0 + 0.25 * max(0, inflight - 1)
         exec_duration = base_duration * speedup_ratio * contention_multiplier
 
@@ -188,11 +179,93 @@ def run_single_experiment(
     return benchmark.results[0], benchmark.results[1]
 
 
+class ParallelVideoAnalyticsBenchmark(Benchmark):
+    """
+    Parallel Fan-Out / Fan-In Video Analytics DAG (inspired by SONIC, USENIX ATC '21):
+      split_video (python-pi on edge gateway nuc)
+        -> K parallel classify_branch_i (resnet50-inference, 2 MB video chunk each)
+        -> aggregate_results (postprocess-fn, 128 KB summary each)
+    Demonstrates the trade-off between Data Locality (co-locating all K branches on one host,
+    which suffers multi-tenant CPU/GPU contention) vs. Parallelism & Makespan Optimization.
+    """
+
+    def __init__(
+        self,
+        scheduler: WorkflowScheduler,
+        passing_mode: DataPassingMode = DataPassingMode.DIRECT,
+        fanout_degree: int = 4,
+        chunk_bytes: int = 2 * 1024 * 1024
+    ):
+        self.scheduler = scheduler
+        self.passing_mode = passing_mode
+        self.fanout_degree = fanout_degree
+        self.chunk_bytes = chunk_bytes
+        self.results: List[WorkflowExecutionResult] = []
+
+    def setup(self, env: Environment):
+        basic.ExampleBenchmark().setup(env)
+
+    def run(self, env: Environment):
+        eb = basic.ExampleBenchmark()
+        pi_fd = eb.prepare_python_pi_deployment()
+        pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+        resnet_fd = eb.prepare_resnet_inference_deployment()
+        resnet_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+        post_fd = EdgeAIWorkflowBenchmark._prepare_postprocess_deployment()
+
+        yield from env.faas.deploy(pi_fd)
+        yield from env.faas.deploy(resnet_fd)
+        yield from env.faas.deploy(post_fd)
+
+        dag = WorkflowDAG(f"video-analytics-k{self.fanout_degree}", default_mode=self.passing_mode)
+        dag.add_task(WorkflowTask(name="split_video", function_name="python-pi", estimated_duration=0.6))
+        dag.add_task(WorkflowTask(name="aggregate", function_name="postprocess-fn", estimated_duration=0.6))
+
+        for i in range(self.fanout_degree):
+            branch_name = f"classify_{i}"
+            dag.add_task(WorkflowTask(name=branch_name, function_name="resnet50-inference", estimated_duration=2.4))
+            dag.add_dependency("split_video", branch_name, size_bytes=self.chunk_bytes)
+            dag.add_dependency(branch_name, "aggregate", size_bytes=128 * 1024)
+
+        storage = [n.name for n in env.topology.get_nodes() if "server" in n.name][0]
+        if hasattr(self.scheduler, "storage_node_ref") and self.scheduler.storage_node_ref is None:
+            self.scheduler.storage_node_ref = storage
+
+        nuc_gateway = [n.name for n in env.topology.get_nodes() if "nuc" in n.name][0]
+        engine = WorkflowEngine(env, scheduler=self.scheduler, storage_node=storage)
+
+        res_cold = yield from engine.execute_workflow(dag, task_placements={"split_video": nuc_gateway})
+        self.results.append(res_cold)
+
+        res_warm = yield from engine.execute_workflow(dag, task_placements={"split_video": nuc_gateway})
+        self.results.append(res_warm)
+
+
+def run_fanout_experiment(
+    scheduler: WorkflowScheduler,
+    mode: DataPassingMode,
+    fanout_degree: int
+) -> Tuple[WorkflowExecutionResult, WorkflowExecutionResult]:
+    np.random.seed(42)
+    topology = basic.example_topology()
+    benchmark = ParallelVideoAnalyticsBenchmark(
+        scheduler=scheduler,
+        passing_mode=mode,
+        fanout_degree=fanout_degree
+    )
+    sim = Simulation(topology, benchmark)
+    sim.create_scheduler = WorkflowSkippyScheduler.create()
+    sim.create_simulator_factory = HeterogeneousSimulatorFactory
+    sim.run()
+    return benchmark.results[0], benchmark.results[1]
+
+
 def generate_plots(
     policy_summary: List[Tuple[str, WorkflowExecutionResult, WorkflowExecutionResult]],
     scaling_summary: Dict[str, List[Tuple[int, WorkflowExecutionResult, WorkflowExecutionResult]]],
+    fanout_summary: Dict[str, List[Tuple[int, WorkflowExecutionResult, WorkflowExecutionResult]]],
     output_dir: str
-) -> Tuple[str, str]:
+) -> Tuple[str, str, str]:
     os.makedirs(output_dir, exist_ok=True)
     plt.rcParams.update({
         "font.size": 11,
@@ -321,7 +394,54 @@ def generate_plots(
     fig2.savefig(fig2_path, bbox_inches="tight")
     plt.close(fig2)
 
-    return fig1_path, fig2_path
+    # -------------------------------------------------------------------------
+    # Figure 3: Parallel Fan-Out Scaling (Video Analytics DAG, K = 1..8)
+    # -------------------------------------------------------------------------
+    fig3, (ax5, ax6) = plt.subplots(1, 2, figsize=(13.5, 5.2))
+
+    for name, records in fanout_summary.items():
+        color, marker, linestyle = styles[name]
+        fanouts_k = [r[0] for r in records]
+        makespans = [r[2].makespan for r in records]
+        distinct_nodes = [
+            len({
+                rec.node_name
+                for t_name, rec in r[2].task_records.items()
+                if t_name.startswith("classify_")
+            })
+            for r in records
+        ]
+
+        ax5.plot(
+            fanouts_k, makespans, label=name,
+            color=color, marker=marker, linestyle=linestyle, linewidth=2.2, markersize=6
+        )
+        ax6.plot(
+            fanouts_k, distinct_nodes, label=name,
+            color=color, marker=marker, linestyle=linestyle, linewidth=2.2, markersize=6
+        )
+
+    ax5.set_xlabel("Parallel Fan-Out Degree (K Classification Branches)")
+    ax5.set_ylabel("Warm End-to-End Makespan (seconds)")
+    ax5.set_title("A. Video Analytics Makespan vs. Fan-Out Degree (K)")
+    ax5.set_xticks([1, 2, 4, 6, 8])
+    ax5.grid(True, linestyle="--", alpha=0.5)
+    ax5.legend(loc="upper left")
+
+    ax6.set_xlabel("Parallel Fan-Out Degree (K Classification Branches)")
+    ax6.set_ylabel("Distinct Worker Nodes Used by Parallel Stage")
+    ax6.set_title("B. Parallel Stage Distribution Across Worker Nodes")
+    ax6.set_xticks([1, 2, 4, 6, 8])
+    ax6.set_ylim(0.5, 8.8)
+    ax6.grid(True, linestyle="--", alpha=0.5)
+    ax6.legend(loc="upper left")
+
+    fig3.tight_layout()
+    fig3_path = os.path.join(output_dir, "workflow_fanout_scaling.png")
+    fig3.savefig(fig3_path, bbox_inches="tight")
+    plt.close(fig3)
+
+    return fig1_path, fig2_path, fig3_path
 
 
 def main():
@@ -406,9 +526,45 @@ def main():
         )
     print("=" * 118)
 
+    # 3. Parallel Fan-Out Benchmark (Video Analytics DAG: split_video -> K x classify_i -> aggregate)
+    fanout_degrees = [1, 2, 4, 6, 8]
+    fanout_summary: Dict[str, List[Tuple[int, WorkflowExecutionResult, WorkflowExecutionResult]]] = {
+        "RoundRobin + RemoteStorage": [],
+        "RoundRobin + Direct": [],
+        "DataAware + Direct": [],
+        "Makespan + Direct": [],
+    }
+
+    print("\n[Experiment 3] Parallel Video Analytics Fan-Out Scaling (split_video -> K x classify -> aggregate, 2 MB/chunk)")
+    print("=" * 118)
+    print(
+        f"{'Fanout K':<8} | {'RR+Remote (s)':>14} | {'RR+Direct (s)':>14} | "
+        f"{'DataAware+Direct (s)':>21} | {'Makespan+Direct (s)':>20} | {'Distinct Nodes (DA vs MS)'}"
+    )
+    print("-" * 118)
+
+    for k in fanout_degrees:
+        c_rrr, w_rrr = run_fanout_experiment(RoundRobinWorkflowScheduler(), DataPassingMode.REMOTE_STORAGE, k)
+        c_rrd, w_rrd = run_fanout_experiment(RoundRobinWorkflowScheduler(), DataPassingMode.DIRECT, k)
+        c_da, w_da = run_fanout_experiment(DataAwareWorkflowScheduler(), DataPassingMode.DIRECT, k)
+        c_ms, w_ms = run_fanout_experiment(MakespanWorkflowScheduler(base_compute_time=1.2), DataPassingMode.DIRECT, k)
+
+        fanout_summary["RoundRobin + RemoteStorage"].append((k, c_rrr, w_rrr))
+        fanout_summary["RoundRobin + Direct"].append((k, c_rrd, w_rrd))
+        fanout_summary["DataAware + Direct"].append((k, c_da, w_da))
+        fanout_summary["Makespan + Direct"].append((k, c_ms, w_ms))
+
+        da_distinct = len({r.node_name for name, r in w_da.task_records.items() if name.startswith("classify_")})
+        ms_distinct = len({r.node_name for name, r in w_ms.task_records.items() if name.startswith("classify_")})
+        print(
+            f"   K = {k:<2} | {w_rrr.makespan:>13.4f}s | {w_rrd.makespan:>13.4f}s | "
+            f"{w_da.makespan:>20.4f}s | {w_ms.makespan:>19.4f}s | DA: {da_distinct} node(s), MS: {ms_distinct} node(s)"
+        )
+    print("=" * 118)
+
     plots_dir = os.path.join(os.path.dirname(__file__), "plots")
-    fig1_path, fig2_path = generate_plots(policy_summary, scaling_summary, plots_dir)
-    print(f"\nSaved comparison plots to:\n  - {fig1_path}\n  - {fig2_path}")
+    fig1_path, fig2_path, fig3_path = generate_plots(policy_summary, scaling_summary, fanout_summary, plots_dir)
+    print(f"\nSaved comparison plots to:\n  - {fig1_path}\n  - {fig2_path}\n  - {fig3_path}")
 
 
 if __name__ == "__main__":

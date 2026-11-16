@@ -56,6 +56,14 @@ class TestWorkflowDAG:
         with pytest.raises(ValueError, match="Self-dependencies are not allowed"):
             dag.add_dependency("A", "A", size_bytes=50)
 
+    def test_duplicate_dependency_rejected(self):
+        dag = WorkflowDAG("dup-dep-test")
+        dag.add_task(WorkflowTask(name="A", function_name="fn-a"))
+        dag.add_task(WorkflowTask(name="B", function_name="fn-b"))
+        dag.add_dependency("A", "B", size_bytes=100)
+        with pytest.raises(ValueError, match="Duplicate dependency"):
+            dag.add_dependency("A", "B", size_bytes=200)
+
     def test_per_edge_data_passing_mode(self):
         dag = WorkflowDAG("hybrid-dag", default_mode=DataPassingMode.DIRECT)
         t1 = WorkflowTask(name="A", function_name="fn-a")
@@ -64,13 +72,20 @@ class TestWorkflowDAG:
 
         dag.add_task(t1).add_task(t2).add_task(t3)
         dag.add_dependency("A", "B", size_bytes=1024, mode=DataPassingMode.COLOCATED)
-        dag.add_dependency("B", "C", size_bytes=2048)  # Should inherit default DIRECT
+        dag.add_dependency("B", "C", size_bytes=2048)  # Inherits default_mode dynamically
 
         deps_from_a = dag.get_downstream_dependencies("A")
         assert deps_from_a[0].mode == DataPassingMode.COLOCATED
+        assert dag.get_effective_mode(deps_from_a[0]) == DataPassingMode.COLOCATED
 
         deps_from_b = dag.get_downstream_dependencies("B")
-        assert deps_from_b[0].mode == DataPassingMode.DIRECT
+        assert deps_from_b[0].mode is None
+        assert dag.get_effective_mode(deps_from_b[0]) == DataPassingMode.DIRECT
+
+        # Changing dag.default_mode dynamically updates unpinned edges
+        dag.default_mode = DataPassingMode.REMOTE_STORAGE
+        assert dag.get_effective_mode(deps_from_b[0]) == DataPassingMode.REMOTE_STORAGE
+        assert dag.get_effective_mode(deps_from_a[0]) == DataPassingMode.COLOCATED
 
 
 class TestDataChannels:
@@ -670,7 +685,8 @@ class TestArchitecturalInvariants:
         """
         I-B5: If planned_node becomes saturated and Skippy places the replica on a
         fallback node actual_node, placements[task.name] and task_records[task.name].node_name
-        must be updated to actual_node so downstream data transfers originate from actual_node.
+        must be updated to actual_node BEFORE incoming data transfer begins, so both incoming
+        and outgoing transfers route to/from actual_node (not the rejected planned_node).
         """
         from faas.system import ScalingConfiguration
         from sim.faassim import Simulation
@@ -678,7 +694,8 @@ class TestArchitecturalInvariants:
         from sim.context.platform.deployment.model import SimScalingConfiguration
 
         topology = basic.example_topology()
-        rpi_node_name = [n.name for n in topology.get_nodes() if "rpi" in n.name][0]
+        rpi_nodes = [n.name for n in topology.get_nodes() if "rpi" in n.name]
+        rpi_0, rpi_1 = rpi_nodes[0], rpi_nodes[1]
         results = []
 
         class FallbackBenchmark(Benchmark):
@@ -689,20 +706,27 @@ class TestArchitecturalInvariants:
                 eb = basic.ExampleBenchmark()
                 pi_fd = eb.prepare_python_pi_deployment()
                 pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                resnet_fd = eb.prepare_resnet_inference_deployment()
+                resnet_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
                 yield from env.faas.deploy(pi_fd)
+                yield from env.faas.deploy(resnet_fd)
 
-                # Deliberately exhaust allocatable CPU on rpi_node_name in Skippy's cluster context
-                saturated_node = next(n for n in env.cluster.list_nodes() if n.name == rpi_node_name)
-                saturated_node.allocatable.cpu_millis = 0
+                # Deliberately exhaust allocatable CPU on both rpi_0 and rpi_1 in Skippy's cluster context
+                for saturated_name in (rpi_0, rpi_1):
+                    s_node = next(n for n in env.cluster.list_nodes() if n.name == saturated_name)
+                    s_node.allocatable.cpu_millis = 0
 
                 dag = WorkflowDAG("fallback-dag", default_mode=DataPassingMode.DIRECT)
                 dag.add_task(WorkflowTask(name="T1", function_name="python-pi"))
-                dag.add_task(WorkflowTask(name="T2", function_name="python-pi"))
+                dag.add_task(WorkflowTask(name="T2", function_name="resnet50-inference"))
                 dag.add_dependency("T1", "T2", size_bytes=1024 * 1024)
 
                 engine = WorkflowEngine(env)
-                # Pin T1 to saturated rpi_node_name; Skippy must fall back to a feasible node
-                res = yield from engine.execute_workflow(dag, task_placements={"T1": rpi_node_name})
+                # Pin both T1 and T2 to saturated nodes; Skippy must fall back for both, and
+                # T1 -> T2 transfer must go from T1's actual_node to T2's actual_node!
+                res = yield from engine.execute_workflow(
+                    dag, task_placements={"T1": rpi_0, "T2": rpi_1}
+                )
                 results.append(res)
 
         sim = Simulation(topology, FallbackBenchmark())
@@ -711,10 +735,13 @@ class TestArchitecturalInvariants:
 
         res = results[0]
         actual_t1_node = res.task_records["T1"].node_name
-        assert actual_t1_node != rpi_node_name
-        # Downstream transfer T1 -> T2 must originate from actual_t1_node, not rpi_node_name
+        actual_t2_node = res.task_records["T2"].node_name
+        assert actual_t1_node != rpi_0
+        assert actual_t2_node != rpi_1
+        # Transfer T1 -> T2 must originate from actual_t1_node AND arrive at actual_t2_node
         tr = res.transfer_records[0]
         assert tr.source_node == actual_t1_node
+        assert tr.target_node == actual_t2_node
 
     def test_invariant_ib6_concurrent_cold_start_isolation(self):
         """
@@ -879,5 +906,110 @@ class TestArchitecturalInvariants:
         assert res.task_records["preprocess"].node_name == res.task_records["inference"].node_name
         assert res.transfer_records[0].mode == DataPassingMode.COLOCATED
         assert res.transfer_records[0].hops == 0
+
+    def test_pure_compute_vs_cold_start_duration_separation(self):
+        """
+        Verifies that WorkflowTaskExecutionRecord.duration and WorkflowExecutionResult.total_compute_time
+        measure pure function execution time (excluding cold-start provisioning delay), while
+        cold_start_duration and total_cold_start_time capture the cold-start image pull and scheduling time.
+        """
+        from faas.system import ScalingConfiguration
+        from sim.faassim import Simulation
+        from sim.benchmark import Benchmark
+        from sim.context.platform.deployment.model import SimScalingConfiguration
+
+        topology = basic.example_topology()
+        results = []
+
+        class ColdStartSeparationBenchmark(Benchmark):
+            def setup(self, env: Environment):
+                basic.ExampleBenchmark().setup(env)
+
+            def run(self, env: Environment):
+                eb = basic.ExampleBenchmark()
+                pi_fd = eb.prepare_python_pi_deployment()
+                pi_fd.scaling_config = SimScalingConfiguration(ScalingConfiguration(scale_min=0))
+                yield from env.faas.deploy(pi_fd)
+
+                dag = WorkflowDAG("cold-sep-dag", default_mode=DataPassingMode.DIRECT)
+                dag.add_task(WorkflowTask(name="only_task", function_name="python-pi"))
+
+                engine = WorkflowEngine(env)
+                res_cold = yield from engine.execute_workflow(dag)
+                res_warm = yield from engine.execute_workflow(dag)
+                results.extend([res_cold, res_warm])
+
+        sim = Simulation(topology, ColdStartSeparationBenchmark())
+        sim.create_scheduler = WorkflowSkippyScheduler.create()
+        sim.run()
+
+        res_cold, res_warm = results[0], results[1]
+        # SimpleFunctionSimulator in faas-sim executes for exactly 1.0s
+        assert res_cold.total_compute_time == pytest.approx(1.0, abs=1e-4)
+        assert res_warm.total_compute_time == pytest.approx(1.0, abs=1e-4)
+        assert res_cold.total_cold_start_time > 0.1
+        assert res_warm.total_cold_start_time == pytest.approx(0.0, abs=1e-6)
+        assert res_cold.makespan == pytest.approx(res_cold.total_cold_start_time + res_cold.total_compute_time, abs=1e-4)
+
+    def test_round_robin_state_persistence_and_data_aware_ancestor_exclusion(self):
+        """
+        Verifies:
+          1. RoundRobinWorkflowScheduler maintains its counter across consecutive workflow executions.
+          2. DataAwareWorkflowScheduler excludes completed sequential ancestors from active node load,
+             allowing a sequential chain A -> B -> C to co-locate even when max_tasks_per_node=1.
+          3. RemoteStorageDataChannel deduplicates fan-out uploads within a workflow run.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        env.flow_factory = UninterruptingFlowFactory()
+
+        # 1. RoundRobin state persistence across runs
+        rr = RoundRobinWorkflowScheduler()
+        dag1 = WorkflowDAG("rr-1")
+        dag1.add_task(WorkflowTask(name="T1", function_name="fn1"))
+        p1 = rr.schedule(dag1, env)
+        p2 = rr.schedule(dag1, env)
+        assert p1["T1"] != p2["T1"]
+
+        # 2. DataAware sequential ancestor exclusion with max_tasks_per_node=1
+        da = DataAwareWorkflowScheduler(max_tasks_per_node=1, load_balance_weight=5.0)
+        chain_dag = WorkflowDAG("seq-chain", default_mode=DataPassingMode.DIRECT)
+        chain_dag.add_task(WorkflowTask(name="A", function_name="fn-a"))
+        chain_dag.add_task(WorkflowTask(name="B", function_name="fn-b"))
+        chain_dag.add_task(WorkflowTask(name="C", function_name="fn-c"))
+        chain_dag.add_dependency("A", "B", size_bytes=5 * 1024 * 1024)
+        chain_dag.add_dependency("B", "C", size_bytes=5 * 1024 * 1024)
+        chain_placements = da.schedule(chain_dag, env)
+        assert chain_placements["A"] == chain_placements["B"] == chain_placements["C"]
+
+        # 3. RemoteStorage fan-out upload deduplication
+        nodes = list(env.topology.get_nodes())
+        rpi_nodes = [n.name for n in nodes if "rpi" in n.name]
+        storage = [n.name for n in nodes if "server" in n.name][0]
+        fanout_dag = WorkflowDAG("remote-fanout", default_mode=DataPassingMode.REMOTE_STORAGE)
+        fanout_dag.add_task(WorkflowTask(name="root", function_name="fn-root"))
+        fanout_dag.add_task(WorkflowTask(name="c1", function_name="fn-c1"))
+        fanout_dag.add_task(WorkflowTask(name="c2", function_name="fn-c2"))
+        fanout_dag.add_dependency("root", "c1", size_bytes=4 * 1024 * 1024)
+        fanout_dag.add_dependency("root", "c2", size_bytes=4 * 1024 * 1024)
+
+        engine = WorkflowEngine(env, storage_node=storage, default_task_duration=0.1)
+        res_list = []
+
+        def run():
+            r = yield from engine.execute_workflow(
+                fanout_dag,
+                task_placements={"root": rpi_nodes[0], "c1": rpi_nodes[1], "c2": rpi_nodes[2]}
+            )
+            res_list.append(r)
+
+        env.process(run())
+        env.run()
+
+        res = res_list[0]
+        hops = sorted(tr.hops for tr in res.transfer_records)
+        # First consumer triggers 1 upload + 1 download (2 hops); second reuses upload and does 1 download (1 hop)
+        assert hops == [1, 2]
+
 
 

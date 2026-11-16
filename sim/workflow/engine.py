@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 class WorkflowTaskExecutionRecord:
     """
     Telemetry record of a single task execution in a workflow.
+    - start_time / end_time / duration: Pure function computation phase.
+    - cold_start_duration: Time spent provisioning/polling a cold replica prior to execution.
     """
     task_name: str
     function_name: str
@@ -27,6 +29,7 @@ class WorkflowTaskExecutionRecord:
     start_time: float
     end_time: float
     duration: float
+    cold_start_duration: float = 0.0
     status: str = "SUCCESS"
 
 
@@ -36,10 +39,11 @@ class WorkflowExecutionResult:
     Summary metrics of an executed workflow.
 
     - makespan: Total wall-clock time elapsed from workflow start to finish.
-                Includes compute time, data transfer time, and concurrency overlap.
+                Includes cold start, data transfer, compute time, and concurrency overlap.
     - total_compute_time: Arithmetic sum of pure function execution durations
-                          across all tasks (excludes network transfer time).
+                          across all tasks (excludes cold-start provisioning and network transfer time).
     - total_data_transfer_time: Arithmetic sum of all intermediate data transfer durations.
+    - total_cold_start_time: Arithmetic sum of replica cold-start/provisioning durations across all tasks.
     """
     workflow_name: str
     start_time: float
@@ -50,6 +54,7 @@ class WorkflowExecutionResult:
     total_data_bytes_transferred: int
     task_records: Dict[str, WorkflowTaskExecutionRecord] = field(default_factory=dict)
     transfer_records: List[DataTransferRecord] = field(default_factory=list)
+    total_cold_start_time: float = 0.0
 
     @property
     def data_transfer_overhead_ratio(self) -> float:
@@ -94,6 +99,8 @@ class WorkflowEngine:
         self._pending_waiters: Counter[Tuple[str, str]] = collections.Counter()
         self._pending_replicas: Dict[Tuple[str, str], Optional[SimFunctionReplica]] = {}
         self._claimed_replica_ids: Set[str] = set()
+        if not hasattr(self.env, "_workflow_active_node_tasks"):
+            self.env._workflow_active_node_tasks = collections.Counter()
 
     def execute_workflow(
         self,
@@ -107,7 +114,8 @@ class WorkflowEngine:
         1. Validates any explicit caller placement overrides.
         2. Creates completion events for each task in the DAG.
         3. Spawns tasks as concurrent SimPy processes; each task waits for its parent tasks
-           to finish computing, gets scheduled on-time, pulls incoming data from the parents'
+           to finish computing, gets scheduled on-time, resolves/deploys its replica on the
+           target node (synchronizing any fallback node), pulls incoming data from the parents'
            actual execution nodes, and executes.
         4. Awaits completion of all tasks and returns execution metrics for this run.
         """
@@ -118,6 +126,7 @@ class WorkflowEngine:
         task_done_events: Dict[str, simpy.Event] = {name: self.env.event() for name in workflow.tasks}
         task_records: Dict[str, WorkflowTaskExecutionRecord] = {}
         run_transfer_records: List[DataTransferRecord] = []
+        shared_uploads: Dict[Tuple[str, str, str, int], simpy.Event] = {}
 
         task_processes = [
             self.env.process(
@@ -128,6 +137,7 @@ class WorkflowEngine:
                     task_done_events=task_done_events,
                     task_records=task_records,
                     run_transfer_records=run_transfer_records,
+                    shared_uploads=shared_uploads,
                     task_executors=task_executors
                 )
             )
@@ -146,46 +156,68 @@ class WorkflowEngine:
         task_done_events: Dict[str, simpy.Event],
         task_records: Dict[str, WorkflowTaskExecutionRecord],
         run_transfer_records: List[DataTransferRecord],
+        shared_uploads: Dict[Tuple[str, str, str, int], simpy.Event],
         task_executors: Optional[Dict[str, Callable]]
     ) -> Generator[simpy.Event, None, None]:
         """
         Lifecycle of a single task in the workflow:
         Step 1: Wait for all upstream parent tasks to finish computing.
         Step 2: Schedule this task on-time (all parents have finished on known nodes).
-        Step 3: Transfer incoming data from all parents' actual nodes to `planned_node` concurrently.
-        Step 4: Invoke computation, record actual execution node, and signal completion.
+        Step 3: Resolve or deploy the target replica on `planned_node` and record `actual_node`
+                (ensuring any Skippy fallback is known before data transfer begins).
+        Step 4: Transfer incoming data from all parents' actual nodes to `actual_node` concurrently.
+        Step 5: Invoke computation on the resolved replica, record metrics, and signal completion.
         """
         # Step 1: Wait for upstream parent computations to complete
         yield from self._wait_for_parents(task.name, workflow, task_done_events)
 
         # Step 2: Schedule task on-time (unless already pinned by caller override)
         planned_node = self._schedule_task_on_time(task, workflow, placements)
+        active_counter: Counter[str] = getattr(self.env, "_workflow_active_node_tasks", collections.Counter())
+        active_counter[planned_node] += 1
+        tracked_node = planned_node
 
-        # Step 3: Transfer incoming data from parents' actual nodes to `planned_node`
-        yield from self._transfer_incoming_data(
-            task=task,
-            target_node=planned_node,
-            workflow=workflow,
-            placements=placements,
-            run_transfer_records=run_transfer_records
-        )
+        try:
+            # Step 3: Resolve or deploy replica on `planned_node` before transferring data
+            target_replica, actual_node, cold_start_duration = yield from self._prepare_execution_target(
+                task, planned_node, task_executors
+            )
+            if actual_node != tracked_node:
+                active_counter[tracked_node] = max(0, active_counter[tracked_node] - 1)
+                active_counter[actual_node] += 1
+                tracked_node = actual_node
+            placements[task.name] = actual_node
 
-        # Step 4: Invoke computation, sync actual execution node, and notify children
-        t_task_start = self.env.now
-        duration, actual_node = yield from self._invoke_function(task, planned_node, task_executors)
-        t_task_end = self.env.now
+            # Step 4: Transfer incoming data from parents' actual nodes to `actual_node`
+            yield from self._transfer_incoming_data(
+                task=task,
+                target_node=actual_node,
+                workflow=workflow,
+                placements=placements,
+                run_transfer_records=run_transfer_records,
+                shared_uploads=shared_uploads
+            )
 
-        placements[task.name] = actual_node
-        task_records[task.name] = WorkflowTaskExecutionRecord(
-            task_name=task.name,
-            function_name=task.function_name,
-            node_name=actual_node,
-            start_time=t_task_start,
-            end_time=t_task_end,
-            duration=duration
-        )
+            # Step 5: Invoke pure function computation and notify downstream children
+            t_task_start = self.env.now
+            duration = yield from self._execute_computation(task, actual_node, target_replica, task_executors)
+            t_task_end = self.env.now
 
-        task_done_events[task.name].succeed()
+            task_records[task.name] = WorkflowTaskExecutionRecord(
+                task_name=task.name,
+                function_name=task.function_name,
+                node_name=actual_node,
+                start_time=t_task_start,
+                end_time=t_task_end,
+                duration=duration,
+                cold_start_duration=cold_start_duration
+            )
+
+            task_done_events[task.name].succeed()
+        finally:
+            active_counter[tracked_node] = max(0, active_counter[tracked_node] - 1)
+            if active_counter[tracked_node] <= 0:
+                active_counter.pop(tracked_node, None)
 
     def _wait_for_parents(
         self,
@@ -223,7 +255,8 @@ class WorkflowEngine:
         target_node: str,
         workflow: WorkflowDAG,
         placements: Dict[str, str],
-        run_transfer_records: List[DataTransferRecord]
+        run_transfer_records: List[DataTransferRecord],
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, None]:
         """
         Transfers all incoming data dependencies from each parent's actual execution node
@@ -240,7 +273,8 @@ class WorkflowEngine:
                     workflow=workflow,
                     source_node=placements[dep.source_task],
                     target_node=target_node,
-                    run_transfer_records=run_transfer_records
+                    run_transfer_records=run_transfer_records,
+                    shared_uploads=shared_uploads
                 )
             )
             for dep in incoming_deps
@@ -253,13 +287,14 @@ class WorkflowEngine:
         workflow: WorkflowDAG,
         source_node: str,
         target_node: str,
-        run_transfer_records: List[DataTransferRecord]
+        run_transfer_records: List[DataTransferRecord],
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, None]:
         """
         Performs a single edge data transfer through the DataTransferController and records
         telemetry for the current workflow run.
         """
-        mode = dep.mode or workflow.default_mode
+        mode = workflow.get_effective_mode(dep)
         record = yield from self.controller.transfer(
             env=self.env,
             mode=mode,
@@ -267,61 +302,79 @@ class WorkflowEngine:
             target_node=target_node,
             size_bytes=dep.size_bytes,
             source_task=dep.source_task,
-            target_task=dep.target_task
+            target_task=dep.target_task,
+            shared_uploads=shared_uploads
         )
         run_transfer_records.append(record)
 
-    def _invoke_function(
+    def _prepare_execution_target(
         self,
         task: WorkflowTask,
-        node_name: str,
+        planned_node: str,
         task_executors: Optional[Dict[str, Callable]]
-    ) -> Generator[simpy.Event, None, Tuple[float, str]]:
+    ) -> Generator[simpy.Event, None, Tuple[Optional[SimFunctionReplica], str, float]]:
         """
-        Executes the function computation and returns `(duration, actual_node_name)`.
-        Prioritizes:
-          1. Custom user executor hook if provided.
-          2. faas-sim's native `env.faas.invoke(FunctionRequest)` if deployed.
-          3. Default simulated task duration.
+        Resolves a RUNNING replica on `planned_node` (or deploys one via Skippy) before incoming
+        data transfer begins, returning `(target_replica, actual_node, cold_start_duration)`.
+        """
+        if task_executors and task.name in task_executors:
+            return None, planned_node, 0.0
+
+        if getattr(self.env, "faas", None) is not None:
+            faas = self.env.faas
+            if hasattr(faas, "deployment_service") and faas.deployment_service.exists(task.function_name):
+                t_prep_start = self.env.now
+                target_replica = yield from self._resolve_or_deploy_replica(faas, task.function_name, planned_node)
+                cold_start_duration = self.env.now - t_prep_start
+                actual_node = (
+                    target_replica.node.name
+                    if target_replica is not None and target_replica.node is not None
+                    else planned_node
+                )
+                return target_replica, actual_node, cold_start_duration
+
+        return None, planned_node, 0.0
+
+    def _execute_computation(
+        self,
+        task: WorkflowTask,
+        actual_node: str,
+        target_replica: Optional[SimFunctionReplica],
+        task_executors: Optional[Dict[str, Callable]]
+    ) -> Generator[simpy.Event, None, float]:
+        """
+        Executes pure function computation on `actual_node` (after replica readiness and data arrival)
+        and returns pure compute `duration`.
         """
         t_start = self.env.now
 
         # 1. Custom executor hook
         if task_executors and task.name in task_executors:
-            res = yield from task_executors[task.name](task, node_name)
-            duration = (self.env.now - t_start) if res is None else float(res)
-            return duration, node_name
+            res = yield from task_executors[task.name](task, actual_node)
+            return (self.env.now - t_start) if res is None else float(res)
 
-        # 2. Native faas-sim invocation pipeline (targets replica on the scheduled node)
-        if getattr(self.env, "faas", None) is not None:
-            faas = self.env.faas
-            if hasattr(faas, "deployment_service") and faas.deployment_service.exists(task.function_name):
-                target_replica = yield from self._resolve_or_deploy_replica(faas, task.function_name, node_name)
-                actual_node = (
-                    target_replica.node.name
-                    if target_replica is not None and target_replica.node is not None
-                    else node_name
-                )
-                req_kwargs = {k: v for k, v in task.kwargs.items() if k in ("size", "client")}
-                request = FunctionRequest(
-                    name=task.function_name,
-                    start=self.env.now,
-                    replica=target_replica,
-                    **req_kwargs
-                )
-                yield from faas.invoke(request)
-                return self.env.now - t_start, actual_node
+        # 2. Native faas-sim invocation pipeline (targets the resolved replica)
+        if target_replica is not None and getattr(self.env, "faas", None) is not None:
+            req_kwargs = {k: v for k, v in task.kwargs.items() if k in ("size", "client")}
+            request = FunctionRequest(
+                name=task.function_name,
+                start=self.env.now,
+                replica=target_replica,
+                **req_kwargs
+            )
+            yield from self.env.faas.invoke(request)
+            return self.env.now - t_start
 
         # 3. Default simulated delay
         yield self.env.timeout(self.default_task_duration)
-        return self.env.now - t_start, node_name
+        return self.env.now - t_start
 
     def _resolve_or_deploy_replica(
         self,
         faas,
         function_name: str,
         node_name: str,
-        poll_interval: float = 0.1
+        poll_interval: float = 0.005
     ) -> Generator[simpy.Event, None, Optional[SimFunctionReplica]]:
         """
         Finds a RUNNING replica of `function_name` on `node_name`.
@@ -346,25 +399,28 @@ class WorkflowEngine:
         self._pending_waiters[key] += 1
 
         try:
-            if self._pending_waiters[key] == 1 and not starting_on_node:
-                before_ids = {
-                    r.replica_id
-                    for r in faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
-                }
-                if isinstance(getattr(self.env, "scheduler", None), WorkflowSkippyScheduler):
-                    self.env.scheduler.enqueue_placement(function_name, node_name)
-                yield from faas.scale_up(function_name, 1)
-                all_reps = faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
-                new_reps = [
-                    r for r in all_reps
-                    if r.replica_id not in before_ids and r.replica_id not in self._claimed_replica_ids
-                ]
-                if new_reps:
-                    claimed = new_reps[0]
-                    self._claimed_replica_ids.add(claimed.replica_id)
-                    self._pending_replicas[key] = claimed
+            if self._pending_waiters[key] == 1:
+                if starting_on_node:
+                    self._pending_replicas[key] = starting_on_node[0]
                 else:
-                    self._pending_replicas[key] = None
+                    before_ids = {
+                        r.replica_id
+                        for r in faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
+                    }
+                    if isinstance(getattr(self.env, "scheduler", None), WorkflowSkippyScheduler):
+                        self.env.scheduler.enqueue_placement(function_name, node_name)
+                    yield from faas.scale_up(function_name, 1)
+                    all_reps = faas.replica_service.get_function_replicas_of_deployment(function_name, running=False)
+                    new_reps = [
+                        r for r in all_reps
+                        if r.replica_id not in before_ids and r.replica_id not in self._claimed_replica_ids
+                    ]
+                    if new_reps:
+                        claimed = new_reps[0]
+                        self._claimed_replica_ids.add(claimed.replica_id)
+                        self._pending_replicas[key] = claimed
+                    else:
+                        self._pending_replicas[key] = None
 
             while True:
                 running_replicas = faas.get_replicas(function_name, state=FunctionReplicaState.RUNNING)
@@ -425,6 +481,7 @@ class WorkflowEngine:
         sorted_transfers = sorted(run_transfer_records, key=lambda r: r.start_time)
 
         total_compute = sum(r.duration for r in task_records.values())
+        total_cold_start = sum(r.cold_start_duration for r in task_records.values())
         total_transfer_time = sum(r.duration for r in sorted_transfers)
         total_bytes = sum(r.size_bytes for r in sorted_transfers)
 
@@ -437,5 +494,6 @@ class WorkflowEngine:
             total_data_transfer_time=total_transfer_time,
             total_data_bytes_transferred=total_bytes,
             task_records=task_records,
-            transfer_records=sorted_transfers
+            transfer_records=sorted_transfers,
+            total_cold_start_time=total_cold_start
         )

@@ -1,7 +1,7 @@
 import abc
 import logging
 from dataclasses import dataclass
-from typing import Generator, Optional, Union, Dict, List
+from typing import Generator, Optional, Tuple, Union, Dict, List
 
 import simpy
 from ether.core import Node, UninterruptingFlow
@@ -62,7 +62,8 @@ class DataChannel(abc.ABC):
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
-        target_task: str = ""
+        target_task: str = "",
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         """
         SimPy generator simulating intermediate data movement between source_node and target_node.
@@ -134,7 +135,8 @@ class DirectDataChannel(DataChannel):
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
-        target_task: str = ""
+        target_task: str = "",
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         src: Node = self._resolve_node(env.topology, source_node)
         dst: Node = self._resolve_node(env.topology, target_node)
@@ -189,7 +191,8 @@ class RemoteStorageDataChannel(DataChannel):
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
-        target_task: str = ""
+        target_task: str = "",
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         src: Node = self._resolve_node(env.topology, source_node)
         dst: Node = self._resolve_node(env.topology, target_node)
@@ -201,8 +204,20 @@ class RemoteStorageDataChannel(DataChannel):
             size_bytes, source_task, src.name, storage.name, t_start
         )
 
-        # Hop 1: Upload from worker to storage
-        yield from self._execute_network_flow(env, src, storage, size_bytes, flow_tag="storage_upload")
+        # Hop 1: Upload from worker to storage (deduplicated if multiple consumers share `shared_uploads`)
+        upload_hops = 0 if src == storage else 1
+        if shared_uploads is not None and source_task:
+            upload_key = (source_task, src.name, storage.name, size_bytes)
+            if upload_key not in shared_uploads:
+                upload_done = env.event()
+                shared_uploads[upload_key] = upload_done
+                yield from self._execute_network_flow(env, src, storage, size_bytes, flow_tag="storage_upload")
+                upload_done.succeed()
+            else:
+                upload_hops = 0
+                yield shared_uploads[upload_key]
+        else:
+            yield from self._execute_network_flow(env, src, storage, size_bytes, flow_tag="storage_upload")
 
         t_mid = env.now
         logger.debug(
@@ -211,6 +226,7 @@ class RemoteStorageDataChannel(DataChannel):
         )
 
         # Hop 2: Download from storage to worker
+        download_hops = 0 if storage == dst else 1
         yield from self._execute_network_flow(env, storage, dst, size_bytes, flow_tag="storage_download")
 
         t_end = env.now
@@ -224,7 +240,7 @@ class RemoteStorageDataChannel(DataChannel):
             end_time=t_end,
             duration=t_end - t_start,
             mode=self.mode,
-            hops=2
+            hops=upload_hops + download_hops
         )
         self.transfer_records.append(record)
         return record
@@ -254,7 +270,8 @@ class ColocatedDataChannel(DirectDataChannel):
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
-        target_task: str = ""
+        target_task: str = "",
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         src: Node = self._resolve_node(env.topology, source_node)
         dst: Node = self._resolve_node(env.topology, target_node)
@@ -311,7 +328,8 @@ class DataTransferController:
         target_node: Union[str, Node],
         size_bytes: int,
         source_task: str = "",
-        target_task: str = ""
+        target_task: str = "",
+        shared_uploads: Optional[Dict[Tuple[str, str, str, int], simpy.Event]] = None
     ) -> Generator[simpy.Event, None, DataTransferRecord]:
         """
         Routes the data transfer to the designated DataChannel.
@@ -322,13 +340,17 @@ class DataTransferController:
                 f"No channel registered for data passing mode '{mode}'. "
                 f"Available modes: {list(self.channels.keys())}"
             )
+        kwargs = {}
+        if isinstance(channel, RemoteStorageDataChannel) and shared_uploads is not None:
+            kwargs["shared_uploads"] = shared_uploads
         return (yield from channel.transfer(
             env=env,
             source_node=source_node,
             target_node=target_node,
             size_bytes=size_bytes,
             source_task=source_task,
-            target_task=target_task
+            target_task=target_task,
+            **kwargs
         ))
 
     def get_all_records(self) -> List[DataTransferRecord]:

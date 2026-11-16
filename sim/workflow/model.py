@@ -88,12 +88,16 @@ class WorkflowDAG:
             raise ValueError(f"Target task '{target_task}' does not exist in workflow '{self.name}'")
         if source_task == target_task:
             raise ValueError(f"Self-dependencies are not allowed (task '{source_task}')")
+        if any(d.target_task == target_task for d in self._downstream.get(source_task, [])):
+            raise ValueError(
+                f"Duplicate dependency '{source_task} -> {target_task}' in workflow '{self.name}'"
+            )
 
         dep = DataDependency(
             source_task=source_task,
             target_task=target_task,
             size_bytes=size_bytes,
-            mode=mode or self.default_mode
+            mode=mode
         )
         self.dependencies.append(dep)
         self._downstream[source_task].append(dep)
@@ -102,6 +106,10 @@ class WorkflowDAG:
         # Validate that no cycles are introduced
         self.get_execution_order()
         return self
+
+    def get_effective_mode(self, dep: DataDependency) -> DataPassingMode:
+        """Returns the dependency's explicit passing mode if set, otherwise the workflow's default_mode."""
+        return dep.mode if dep.mode is not None else self.default_mode
 
     def get_downstream_dependencies(self, task_name: str) -> List[DataDependency]:
         """Returns outgoing data dependencies from task_name."""

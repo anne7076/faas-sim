@@ -132,12 +132,43 @@ class WorkflowScheduler(abc.ABC):
     ) -> float:
         """
         Estimates cold-start latency penalty for `task` on `node`:
-          - 0.0 if `node` already hosts a warm replica of `task.function_name` (or if no warm replicas exist yet).
-          - `base_penalty` when warm replicas exist on other nodes but `node` is cold.
+          - 0.0 if `node` already hosts a warm replica of `task.function_name`.
+          - When warm replicas or cached container images exist in the cluster:
+            - `base_penalty` if the container image is already cached in `env.cluster.images_on_nodes[node.name]`.
+            - `base_penalty + 0.1 * pull_time` (unique layer download time per Rausch et al. Skippy model)
+              if the image must be pulled from `DockerRegistry` to `node`.
+          - 0.0 when no warm replicas or cached images exist anywhere yet.
         """
-        if not warm_nodes or node.name in warm_nodes:
+        if node.name in warm_nodes:
             return 0.0
-        return base_penalty
+
+        if (
+            getattr(env, "faas", None) is not None
+            and getattr(env, "cluster", None) is not None
+            and getattr(env, "container_registry", None) is not None
+            and getattr(env, "topology", None) is not None
+            and hasattr(env.faas, "deployment_service")
+            and env.faas.deployment_service.exists(task.function_name)
+        ):
+            fd = env.faas.deployment_service.get_by_name(task.function_name)
+            containers = fd.deployment_ranking.containers if fd.deployment_ranking else fd.fn_containers
+            if containers:
+                image_str = containers[0].image
+                norm_image = normalize_image_name(image_str)
+                images_on_nodes = getattr(env.cluster, "images_on_nodes", {})
+                any_image_cached = any(norm_image in imgs for imgs in images_on_nodes.values())
+                if not warm_nodes and not any_image_cached:
+                    return 0.0
+                if norm_image in images_on_nodes.get(node.name, set()):
+                    return base_penalty
+                images = env.container_registry.find(image_str, arch=getattr(node, "arch", None))
+                if images and images[0].size > 0 and DockerRegistry in env.topology.nodes:
+                    unique_layer_bytes = int(images[0].size * 0.1)
+                    pull_time = self._estimate_flow_time(env, DockerRegistry, node, unique_layer_bytes)
+                    return base_penalty + pull_time
+            return base_penalty if warm_nodes else 0.0
+
+        return base_penalty if warm_nodes else 0.0
 
     @staticmethod
     def _get_ancestors(workflow: WorkflowDAG, task_name: str) -> Set[str]:
@@ -152,7 +183,55 @@ class WorkflowScheduler(abc.ABC):
         return ancestors
 
     @staticmethod
+    def compute_node_speedup_ratio(node: Node, reference_cpu_millis: float = 4000.0) -> float:
+        """
+        Computes the single-task execution time multiplier (`reference_cpu / effective_cpu`) for `node`:
+          - Up to 4x core speedup (`16,000m` cap for a single container).
+          - 1.5x hardware acceleration boost on CUDA-capable nodes (`embai` / GPU servers).
+          - 0.5x per-core IPC adjustment on resource-constrained ARM SBCs (`sbc` / Raspberry Pi).
+        """
+        capacity = getattr(node, "capacity", None)
+        node_cpu = float(getattr(capacity, "cpu_millis", reference_cpu_millis)) if capacity else reference_cpu_millis
+        if node_cpu <= 0:
+            node_cpu = reference_cpu_millis
+
+        effective_cpu = min(node_cpu, reference_cpu_millis * 4.0)
+        labels = getattr(node, "labels", {}) or {}
+        if "ether.edgerun.io/capabilities/cuda" in labels:
+            effective_cpu *= 1.5
+        elif labels.get("ether.edgerun.io/type") == "sbc":
+            effective_cpu *= 0.5
+
+        return reference_cpu_millis / effective_cpu
+
+    @staticmethod
+    def _get_active_node_load(env: Environment, node_name: str, local_concurrent_tasks: int = 0) -> int:
+        """
+        Returns the number of active concurrent tasks/requests on `node_name`, combining:
+          1. Concurrent (non-ancestor) tasks in the current workflow (`local_concurrent_tasks`).
+          2. Active workflow tasks tracked across the environment (`env._workflow_active_node_tasks`).
+          3. Active in-flight FaasSystem requests on `node_name`.
+        """
+        env_active = 0
+        if hasattr(env, "_workflow_active_node_tasks"):
+            env_active = env._workflow_active_node_tasks.get(node_name, 0)
+
+        inflight_requests = 0
+        if getattr(env, "context", None) is not None and hasattr(env.context, "request_service"):
+            req_svc = env.context.request_service
+            inflight_requests = sum(
+                1 for r in req_svc.get_inflight_request(node_name)
+                if getattr(r, "replica", None) is not None
+                and getattr(r.replica, "node", None) is not None
+                and r.replica.node.name == node_name
+                and req_svc.get_end_ts(r.request_id) is None
+            )
+
+        return max(local_concurrent_tasks, env_active, inflight_requests)
+
+    @classmethod
     def _estimate_compute_time(
+        cls,
         env: Environment,
         task: WorkflowTask,
         node: Node,
@@ -162,7 +241,7 @@ class WorkflowScheduler(abc.ABC):
         contention_factor: float = 0.25
     ) -> float:
         """
-        Estimates function compute duration on `node` based on its CPU capacity (`cpu_millis`)
+        Estimates function compute duration on `node` based on its hardware tier/capacity
         and current active contention/load.
         """
         raw_base = (
@@ -171,33 +250,8 @@ class WorkflowScheduler(abc.ABC):
             else task.kwargs.get("estimated_duration", base_duration)
         )
         task_base = float(raw_base)
-        capacity = getattr(node, "capacity", None)
-        node_cpu = float(getattr(capacity, "cpu_millis", reference_cpu_millis)) if capacity else reference_cpu_millis
-        if node_cpu <= 0:
-            node_cpu = reference_cpu_millis
-
-        # A single function container can utilize up to 4x reference core speed (16,000m),
-        # with hardware tier adjustments for CUDA accelerators (1.5x) and ARM SBCs (0.5x).
-        effective_cpu = min(node_cpu, reference_cpu_millis * 4.0)
-        labels = getattr(node, "labels", {}) or {}
-        if "ether.edgerun.io/capabilities/cuda" in labels:
-            effective_cpu *= 1.5
-        elif labels.get("ether.edgerun.io/type") == "sbc":
-            effective_cpu *= 0.5
-
-        speedup_ratio = reference_cpu_millis / effective_cpu
-        inflight_requests = 0
-        if getattr(env, "context", None) is not None and hasattr(env.context, "request_service"):
-            req_svc = env.context.request_service
-            inflight_requests = sum(
-                1 for r in req_svc.get_inflight_request(node.name)
-                if getattr(r, "replica", None) is not None
-                and getattr(r.replica, "node", None) is not None
-                and r.replica.node.name == node.name
-                and req_svc.get_end_ts(r.request_id) is None
-            )
-
-        concurrent_load = max(active_tasks_on_node, inflight_requests)
+        speedup_ratio = cls.compute_node_speedup_ratio(node, reference_cpu_millis=reference_cpu_millis)
+        concurrent_load = cls._get_active_node_load(env, node.name, local_concurrent_tasks=active_tasks_on_node)
         load_multiplier = 1.0 + (contention_factor * concurrent_load)
         return task_base * speedup_ratio * load_multiplier
 
@@ -222,7 +276,8 @@ class WorkflowScheduler(abc.ABC):
         dst_node: Node,
         size_bytes: int,
         mode: DataPassingMode,
-        storage_node: Optional[Node] = None
+        storage_node: Optional[Node] = None,
+        concurrent_flows_per_link: Optional[Dict[int, int]] = None
     ) -> float:
         """
         Estimates the transfer time in seconds for `size_bytes` from `src_node` to `dst_node`.
@@ -235,17 +290,31 @@ class WorkflowScheduler(abc.ABC):
 
         if mode == DataPassingMode.REMOTE_STORAGE:
             effective_storage = storage_node or src_node
-            hop1 = self._estimate_flow_time(env, src_node, effective_storage, size_bytes)
-            hop2 = self._estimate_flow_time(env, effective_storage, dst_node, size_bytes)
+            hop1 = self._estimate_flow_time(
+                env, src_node, effective_storage, size_bytes, concurrent_flows_per_link
+            )
+            hop2 = self._estimate_flow_time(
+                env, effective_storage, dst_node, size_bytes, concurrent_flows_per_link
+            )
             return hop1 + hop2
 
-        return self._estimate_flow_time(env, src_node, dst_node, size_bytes)
+        return self._estimate_flow_time(
+            env, src_node, dst_node, size_bytes, concurrent_flows_per_link
+        )
 
-    def _estimate_flow_time(self, env: Environment, src: Node, dst: Node, size_bytes: int) -> float:
+    def _estimate_flow_time(
+        self,
+        env: Environment,
+        src: Node,
+        dst: Node,
+        size_bytes: int,
+        concurrent_flows_per_link: Optional[Dict[int, int]] = None
+    ) -> float:
         """
         Estimates TCP flow duration across Ether network topology matching `ether.core.Flow`:
           Duration = connection_time + (size_bytes / goodput_bps)
-        where `link.bandwidth` in Ether is in Mbps (1 Mbps = 125,000 bytes/s, TCP goodput factor = 0.97).
+        where `link.bandwidth` in Ether is in Mbps (1 Mbps = 125,000 bytes/s, TCP goodput factor = 0.97),
+        accounting for max-min fair bandwidth sharing across concurrent sibling flows on shared links.
         """
         if src == dst or env.topology is None:
             return size_bytes / 1e9
@@ -255,7 +324,11 @@ class WorkflowScheduler(abc.ABC):
             connection_time = (route.rtt * 1.5) / 1000.0
 
             if route.hops:
-                bottleneck_mbps = min(getattr(link, "bandwidth", 100.0) for link in route.hops)
+                bottleneck_mbps = min(
+                    getattr(link, "bandwidth", 100.0)
+                    / (1 + (concurrent_flows_per_link.get(id(link), 0) if concurrent_flows_per_link else 0))
+                    for link in route.hops
+                )
                 if bottleneck_mbps <= 0:
                     bottleneck_mbps = 1.0
                 goodput_bps = bottleneck_mbps * 125000.0 * 0.97
@@ -282,7 +355,11 @@ class RoundRobinWorkflowScheduler(WorkflowScheduler):
     Baseline workflow-agnostic scheduler:
     Places tasks in round-robin fashion across feasible compute nodes without
     considering data dependencies, payload sizes, or network topology.
+    Maintains a persistent counter across tasks and consecutive workflow arrivals.
     """
+
+    def __init__(self):
+        self._counter: int = 0
 
     def schedule_task(
         self,
@@ -292,8 +369,18 @@ class RoundRobinWorkflowScheduler(WorkflowScheduler):
         env: Environment
     ) -> str:
         available_nodes = self._get_compute_nodes(env, task)
-        idx = len(placements)
-        return available_nodes[idx % len(available_nodes)].name
+        warm_nodes = self._get_warm_node_names(env, task.function_name)
+        ancestors = self._get_ancestors(workflow, task.name)
+        busy_nodes = {
+            node_name for t_name, node_name in placements.items() if t_name not in ancestors
+        }
+        idle_warm_nodes = [
+            n for n in available_nodes if n.name in warm_nodes and n.name not in busy_nodes
+        ]
+        pool = idle_warm_nodes if idle_warm_nodes else available_nodes
+        idx = self._counter
+        self._counter += 1
+        return pool[idx % len(pool)].name
 
 
 class DataAwareWorkflowScheduler(WorkflowScheduler):
@@ -306,7 +393,7 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
     Placement Objective:
       Minimizes intermediate data transfer latency by co-locating tightly coupled tasks
       or placing them on nodes connected by high-bandwidth / low-latency direct links,
-      with optional load-balancing weighting.
+      with optional active load-balancing weighting.
     """
 
     def __init__(
@@ -335,17 +422,24 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
         storage_node = self._resolve_node(env, self.storage_node_ref) if self.storage_node_ref else None
 
         warm_nodes = self._get_warm_node_names(env, task.function_name)
-        node_task_count: Dict[str, int] = collections.Counter(placements.values())
+        ancestors = self._get_ancestors(workflow, task.name)
+        concurrent_task_count: Dict[str, int] = collections.Counter(
+            node_name for t_name, node_name in placements.items() if t_name not in ancestors
+        )
+        active_load_by_node: Dict[str, int] = {
+            n.name: self._get_active_node_load(env, n.name, concurrent_task_count[n.name])
+            for n in candidate_nodes
+        }
 
         eligible_candidates = [
             n for n in candidate_nodes
-            if self.max_tasks_per_node is None or node_task_count[n.name] < self.max_tasks_per_node
+            if self.max_tasks_per_node is None or active_load_by_node[n.name] < self.max_tasks_per_node
         ]
         if not eligible_candidates:
             eligible_candidates = candidate_nodes
 
         # Root tasks: prefer nodes that can also co-locate the heaviest downstream consumer
-        # (Edge Case E-1), then warm nodes, then lowest current task count
+        # (Edge Case E-1), then warm nodes, then lowest active concurrent load
         if not incoming_deps:
             outgoing_deps = workflow.get_downstream_dependencies(task.name)
             colocatable_names: Set[str] = set()
@@ -362,7 +456,7 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
                 key=lambda n: (
                     0.0 if (not colocatable_names or n.name in colocatable_names) else 1.0,
                     0.0 if (not warm_nodes or n.name in warm_nodes) else self.cold_start_penalty,
-                    node_task_count[n.name]
+                    active_load_by_node[n.name]
                 )
             )
             logger.debug("[DataAwareScheduler] Placed root task '%s' on '%s'", task.name, best_node.name)
@@ -385,7 +479,7 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
                 if parent_node is None:
                     parent_node = Node(parent_node_name)
 
-                mode = dep.mode or workflow.default_mode
+                mode = workflow.get_effective_mode(dep)
                 cost = self._estimate_transfer_time(
                     env=env,
                     src_node=parent_node,
@@ -396,7 +490,7 @@ class DataAwareWorkflowScheduler(WorkflowScheduler):
                 )
                 total_transfer_cost += cost
 
-            load_penalty = node_task_count[candidate.name] * self.load_balance_weight
+            load_penalty = active_load_by_node[candidate.name] * self.load_balance_weight
             cold_penalty = (
                 self.cold_start_penalty
                 if (warm_nodes and candidate.name not in warm_nodes)
@@ -425,10 +519,11 @@ class MakespanWorkflowScheduler(WorkflowScheduler):
       Score(n) = max_{u in parents(task)} TransferTime(u -> n)
                  + ColdStartPenalty(task, n)
                  + EstimatedComputeTime(task, n)
+                 + UnavoidableDownstreamTransfer(task, n)  [for root tasks]
 
     Unlike `DataAwareWorkflowScheduler` (which purely minimizes network transfer cost),
     `MakespanWorkflowScheduler` trades off network transfer time against heterogeneous
-    node compute speed (`cpu_millis`) and node contention.
+    node compute speed (`cpu_millis`, GPU capabilities) and active node contention.
     """
 
     def __init__(
@@ -461,6 +556,43 @@ class MakespanWorkflowScheduler(WorkflowScheduler):
             node_name for t_name, node_name in placements.items() if t_name not in ancestors
         )
 
+        # Track link contention from already-placed concurrent sibling transfers out of the same parents
+        concurrent_flows_per_link: Dict[int, int] = collections.Counter()
+        if env.topology is not None and incoming_deps:
+            for dep in incoming_deps:
+                parent_node_name = placements.get(dep.source_task)
+                if parent_node_name is None:
+                    continue
+                parent_node = env.topology.find_node(parent_node_name)
+                if parent_node is None:
+                    continue
+                for sib_dep in workflow.get_downstream_dependencies(dep.source_task):
+                    sib_task = sib_dep.target_task
+                    if sib_task == task.name or sib_task in ancestors or sib_task not in placements:
+                        continue
+                    sib_node = env.topology.find_node(placements[sib_task])
+                    if sib_node is not None and sib_node != parent_node:
+                        try:
+                            sib_route = env.topology.route(parent_node, sib_node)
+                            for hop in sib_route.hops:
+                                concurrent_flows_per_link[id(hop)] += 1
+                        except Exception:
+                            pass
+
+        # Edge Case E-1 lookahead for root tasks: if candidate cannot co-locate the heaviest
+        # downstream consumer, include the minimum unavoidable outgoing transfer time.
+        heaviest_out_dep: Optional[DataDependency] = None
+        child_feasible_nodes: List[Node] = []
+        child_feasible_names: Set[str] = set()
+        if not incoming_deps:
+            outgoing_deps = workflow.get_downstream_dependencies(task.name)
+            if outgoing_deps:
+                heaviest_out_dep = max(outgoing_deps, key=lambda d: d.size_bytes)
+                child_task = workflow.tasks.get(heaviest_out_dep.target_task)
+                if child_task is not None and heaviest_out_dep.size_bytes > 0:
+                    child_feasible_nodes = self._get_compute_nodes(env, child_task)
+                    child_feasible_names = {n.name for n in child_feasible_nodes}
+
         best_node = None
         best_completion_time = float("inf")
 
@@ -475,17 +607,37 @@ class MakespanWorkflowScheduler(WorkflowScheduler):
                     env.topology.find_node(parent_node_name)
                     if env.topology is not None else None
                 ) or Node(parent_node_name)
-                mode = dep.mode or workflow.default_mode
+                mode = workflow.get_effective_mode(dep)
                 t_transfer = self._estimate_transfer_time(
                     env=env,
                     src_node=parent_node,
                     dst_node=candidate,
                     size_bytes=dep.size_bytes,
                     mode=mode,
-                    storage_node=storage_node
+                    storage_node=storage_node,
+                    concurrent_flows_per_link=concurrent_flows_per_link
                 )
                 if t_transfer > max_transfer_time:
                     max_transfer_time = t_transfer
+
+            downstream_penalty = 0.0
+            if (
+                heaviest_out_dep is not None
+                and child_feasible_nodes
+                and candidate.name not in child_feasible_names
+            ):
+                out_mode = workflow.get_effective_mode(heaviest_out_dep)
+                downstream_penalty = min(
+                    self._estimate_transfer_time(
+                        env=env,
+                        src_node=candidate,
+                        dst_node=cn,
+                        size_bytes=heaviest_out_dep.size_bytes,
+                        mode=out_mode,
+                        storage_node=storage_node
+                    )
+                    for cn in child_feasible_nodes
+                )
 
             cold_penalty = self._estimate_cold_start_time(
                 env=env,
@@ -504,7 +656,7 @@ class MakespanWorkflowScheduler(WorkflowScheduler):
                 contention_factor=self.contention_factor
             )
 
-            completion_time = max_transfer_time + cold_penalty + est_compute
+            completion_time = max_transfer_time + cold_penalty + est_compute + downstream_penalty
             if completion_time < best_completion_time:
                 best_completion_time = completion_time
                 best_node = candidate
@@ -624,8 +776,13 @@ class WorkflowSkippyScheduler(Scheduler):
     @staticmethod
     def _extract_function_name(pod: Pod) -> str:
         """
-        Extracts the function deployment name from a faas-sim Pod name (`pod-{fn_name}-{cnt}`).
+        Extracts the function deployment name from `pod.spec.labels['faas-function']`
+        (set by `sim.skippy.create_function_pod`), falling back to `pod-{fn_name}-{cnt}` parsing.
         """
+        if pod.spec is not None and getattr(pod.spec, "labels", None):
+            fn_label = pod.spec.labels.get("faas-function")
+            if fn_label:
+                return fn_label
         if pod.name.startswith("pod-"):
             parts = pod.name.split("-")
             if len(parts) >= 3:
