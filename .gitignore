@@ -229,3 +229,8 @@ pip-selfcheck.json
 
 # Sphinx build
 _build
+
+# Agent instruction files excluded from git
+AGENTS.md
+CLAUDE.md
+
