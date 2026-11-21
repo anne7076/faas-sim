@@ -133,11 +133,11 @@ class WorkflowScheduler(abc.ABC):
         """
         Estimates cold-start latency penalty for `task` on `node`:
           - 0.0 if `node` already hosts a warm replica of `task.function_name`.
-          - When warm replicas or cached container images exist in the cluster:
-            - `base_penalty` if the container image is already cached in `env.cluster.images_on_nodes[node.name]`.
-            - `base_penalty + 0.1 * pull_time` (unique layer download time per Rausch et al. Skippy model)
-              if the image must be pulled from `DockerRegistry` to `node`.
-          - 0.0 when no warm replicas or cached images exist anywhere yet.
+          - `base_penalty` if the container image is already cached in `env.cluster.images_on_nodes[node.name]`.
+          - `base_penalty + 0.1 * pull_time` (unique layer download time per Rausch et al. Skippy model)
+            if the image must be pulled from `DockerRegistry` to `node`.
+          - `base_penalty` fallback when registry/deployment metadata is absent and warm replicas exist
+            elsewhere; `0.0` if no warm replicas exist anywhere (constant offset has no effect on `argmin`).
         """
         if node.name in warm_nodes:
             return 0.0
@@ -156,9 +156,6 @@ class WorkflowScheduler(abc.ABC):
                 image_str = containers[0].image
                 norm_image = normalize_image_name(image_str)
                 images_on_nodes = getattr(env.cluster, "images_on_nodes", {})
-                any_image_cached = any(norm_image in imgs for imgs in images_on_nodes.values())
-                if not warm_nodes and not any_image_cached:
-                    return 0.0
                 if norm_image in images_on_nodes.get(node.name, set()):
                     return base_penalty
                 images = env.container_registry.find(image_str, arch=getattr(node, "arch", None))
