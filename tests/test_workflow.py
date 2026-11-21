@@ -1,5 +1,6 @@
 import pytest
 import simpy
+from ether.core import Node
 
 import examples.basic.main as basic
 from sim.core import Environment
@@ -202,6 +203,31 @@ class TestDataChannels:
             DataPassingMode.COLOCATED,
             DataPassingMode.REMOTE_STORAGE
         ]
+
+    def test_resolve_node_validates_active_topology(self):
+        """
+        Validates that DataChannel._resolve_node checks both string lookups and
+        explicit Node object existence in the active simulated topology.
+        """
+        env = Environment()
+        env.topology = basic.example_topology()
+        channel = DirectDataChannel()
+
+        valid_node = list(env.topology.get_nodes())[0]
+
+        # Valid string and valid Node instance succeed
+        assert channel._resolve_node(env.topology, valid_node.name) == valid_node
+        assert channel._resolve_node(env.topology, valid_node) == valid_node
+
+        # Non-existent string name raises ValueError
+        with pytest.raises(ValueError, match="not found in the topology"):
+            channel._resolve_node(env.topology, "non_existent_node_xyz")
+
+        # Orphan Node instance not in topology raises ValueError
+        orphan_node = Node("orphan_node_not_in_topo")
+        with pytest.raises(ValueError, match="does not exist in the active topology"):
+            channel._resolve_node(env.topology, orphan_node)
+
 
 
 class TestWorkflowEngine:

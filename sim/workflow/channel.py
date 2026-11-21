@@ -73,6 +73,8 @@ class DataChannel(abc.ABC):
     def _resolve_node(self, topology, node: Union[str, Node]) -> Node:
         """Resolves node name or Node instance to an ether.core.Node in the topology."""
         if isinstance(node, Node):
+            if node not in topology:
+                raise ValueError(f"Node '{node.name}' does not exist in the active topology.")
             return node
         found = topology.find_node(node)
         if found is None:
